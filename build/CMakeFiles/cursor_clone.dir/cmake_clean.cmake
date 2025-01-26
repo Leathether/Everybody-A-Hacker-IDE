@@ -5,6 +5,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/cursor_clone.dir/groq_client.cpp.o.d"
   "CMakeFiles/cursor_clone.dir/main.cpp.o"
   "CMakeFiles/cursor_clone.dir/main.cpp.o.d"
+  "CMakeFiles/cursor_clone.dir/pinecone_client.cpp.o"
+  "CMakeFiles/cursor_clone.dir/pinecone_client.cpp.o.d"
   "CMakeFiles/cursor_clone.dir/text_editor.cpp.o"
   "CMakeFiles/cursor_clone.dir/text_editor.cpp.o.d"
   "cursor_clone"

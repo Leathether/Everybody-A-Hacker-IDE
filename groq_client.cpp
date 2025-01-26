@@ -6,18 +6,18 @@
 
 using json = nlohmann::json;
 
-// Callback function to handle CURL response
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
+// Change the global WriteCallback to be a member function
+size_t GroqClient::WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     userp->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-std::string GroqClient::getCompletion(const std::string& prompt) {
+std::string GroqClient::makeRequest(const std::string& endpoint, const json& request_data) {
     CURL* curl = curl_easy_init();
     std::string response;
 
     if (!curl) {
-        return "Error: Failed to initialize CURL";
+        throw std::runtime_error("Failed to initialize CURL");
     }
 
     try {
@@ -26,7 +26,44 @@ std::string GroqClient::getCompletion(const std::string& prompt) {
         std::string auth_header = "Authorization: Bearer " + api_key;
         headers = curl_slist_append(headers, auth_header.c_str());
 
-        // Create the request payload with the correct format
+        std::string url = api_endpoint + endpoint;
+        std::string request_body = request_data.dump();
+
+        // Debug output
+        if (debug_mode) {
+            std::cout << "Request URL: " << url << std::endl;
+            std::cout << "Request body: " << request_body << std::endl;
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+        
+        if (debug_mode) {
+            curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        }
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
+        }
+
+        return response;
+
+    } catch (const std::exception& e) {
+        if (curl) curl_easy_cleanup(curl);
+        throw;
+    }
+}
+
+std::string GroqClient::getCompletion(const std::string& prompt) {
+    try {
         json request_data = {
             {"model", "mixtral-8x7b-32768"},
             {"messages", json::array({
@@ -44,63 +81,50 @@ std::string GroqClient::getCompletion(const std::string& prompt) {
             {"stream", false}
         };
 
-        std::string request_body = request_data.dump();
-
-        // Debug output
-        std::cout << "Request URL: " << api_endpoint << std::endl;
-        std::cout << "Request body: " << request_body << std::endl;
-
-        // Set CURL options
-        curl_easy_setopt(curl, CURLOPT_URL, api_endpoint.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+        std::string response = makeRequest("chat/completions", request_data);
         
-        // Enable verbose debug output
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-        // Perform the request
-        CURLcode res = curl_easy_perform(curl);
-
-        // Clean up
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK) {
-            std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
-            return "Error: " + std::string(curl_easy_strerror(res));
+        if (debug_mode) {
+            std::cout << "Response received, length: " << response.length() << std::endl;
         }
 
-        // Debug output
-        std::cout << "Raw response: " << response << std::endl;
-
-        // Parse and extract the response
         json response_json = json::parse(response);
         
-        // Check for API errors
-        if (response_json.contains("error")) {
-            std::cerr << "API error: " << response_json["error"].dump(2) << std::endl;
-            return "Error: " + response_json["error"]["message"].get<std::string>();
-        }
-
-        // Extract the response content
         if (response_json.contains("choices") && 
             !response_json["choices"].empty() && 
             response_json["choices"][0].contains("message") &&
             response_json["choices"][0]["message"].contains("content")) {
             
-            return response_json["choices"][0]["message"]["content"].get<std::string>();
+            std::string content = response_json["choices"][0]["message"]["content"].get<std::string>();
+            
+            if (!content.empty() && debug_mode) {
+                std::cout << "Successfully extracted content, length: " << content.length() << std::endl;
+            }
+            return content;
         }
 
-        return "Error: Unexpected response format";
+        return "Error: Invalid response format";
 
-    } catch (const json::exception& e) {
-        std::cerr << "JSON error: " << e.what() << std::endl;
-        return "Error parsing response: " + std::string(e.what());
     } catch (const std::exception& e) {
-        std::cerr << "General error: " << e.what() << std::endl;
+        std::cerr << "Error in getCompletion: " << e.what() << std::endl;
         return "Error: " + std::string(e.what());
     }
+}
+
+std::vector<float> GroqClient::getEmbedding(const std::string& text) {
+    json request_data = {
+        {"model", "mixtral-8x7b-32768"},
+        {"input", text},
+        {"encoding_format", "float"}
+    };
+
+    std::string response = makeRequest("/embeddings", request_data);
+    json response_json = json::parse(response);
+    
+    if (response_json.contains("data") && 
+        !response_json["data"].empty() && 
+        response_json["data"][0].contains("embedding")) {
+        return response_json["data"][0]["embedding"].get<std::vector<float>>();
+    }
+    
+    throw std::runtime_error("Failed to get embedding from API");
 }

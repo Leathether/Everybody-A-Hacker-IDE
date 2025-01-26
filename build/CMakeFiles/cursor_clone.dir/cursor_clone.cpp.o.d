@@ -319,7 +319,9 @@ CMakeFiles/cursor_clone.dir/cursor_clone.cpp.o: \
  /home/leathether/Documents/Projects/imgui/imgui.h \
  /home/leathether/Documents/Projects/imgui/imconfig.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/float.h \
- /usr/include/c++/11/iostream /usr/include/c++/11/unordered_set \
+ /usr/include/c++/11/iostream \
+ /home/leathether/Documents/Projects/pinecone_client.hpp \
+ /usr/include/c++/11/unordered_set \
  /usr/include/c++/11/bits/unordered_set.h /usr/include/c++/11/thread \
  /usr/include/c++/11/bits/std_thread.h \
  /usr/include/c++/11/bits/this_thread_sleep.h /usr/include/c++/11/mutex \

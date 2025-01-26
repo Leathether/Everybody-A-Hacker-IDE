@@ -10,6 +10,7 @@
 #include <future>
 #include <unordered_map>
 #include <chrono>
+#include <nlohmann/json.hpp>
 
 // Add these headers for fcntl and flags
 #if !defined(_WIN32)
@@ -40,22 +41,40 @@ namespace TerminalColors {
 
 CursorClone::CursorClone(const std::string& api_key) 
     : groq_client(api_key) {
+    
+    // Get Pinecone API key from environment
+    const char* pinecone_key = std::getenv("PINECONE_API_KEY");
+    
+    if (!pinecone_key) {
+        std::cerr << "Warning: PINECONE_API_KEY environment variable not set. Directory embeddings will be disabled." << std::endl;
+        embeddings_enabled = false;
+        // Don't try to create pinecone_client
+    } else {
+        try {
+            pinecone_client = std::make_unique<PineconeClient>(pinecone_key, groq_client);
+            embeddings_enabled = true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Failed to initialize Pinecone client: " << e.what() << std::endl;
+            std::cerr << "Directory embeddings will be disabled." << std::endl;
+            embeddings_enabled = false;
+            // Don't rethrow - let the program continue without Pinecone
+        }
+    }
+    
+    // Initialize chat history with a welcome message
+    chat_history = "Welcome to Cursor Clone! How can I help you today?\n";
+    
+    // Initialize input buffers
     input_buffer[0] = '\0';
+    terminal_buffer[0] = '\0';
     file_path_buffer[0] = '\0';
     
-    try {
-        // Start in home directory
-        current_directory = getHomeDirectory();
-        std::cout << "Starting in home directory: " << current_directory << std::endl;
-        
-        refreshDirectoryContent();
-        setupFonts();
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Error initializing: " << e.what() << std::endl;
-        current_directory = fs::current_path().string();
-        refreshDirectoryContent();
-    }
+    // Set up current directory
+    current_directory = fs::current_path().string();
+    loadDirectoryQuick(current_directory);
+    
+    // Set up fonts
+    setupFonts();
 }
 
 CursorClone::~CursorClone() {
@@ -280,6 +299,11 @@ void CursorClone::writeFile(const std::string& path, const std::string& content)
         }
         #endif
         
+        // After successfully writing the file, force a directory refresh
+        if (fs::path(path).parent_path() == fs::path(current_directory)) {
+            forceDirectoryRefresh();
+        }
+        
     } catch (const std::exception& e) {
         std::cerr << "Error writing file " << path << ": " << e.what() << std::endl;
         throw;
@@ -288,277 +312,86 @@ void CursorClone::writeFile(const std::string& path, const std::string& content)
 
 std::string CursorClone::getAIAssistance(const std::string& query) {
     try {
-        std::string currentFileName = editor.getCurrentFile();
-        std::string fileContent = editor.getContent();
-        size_t cursorPos = editor.getCursorPosition();
+        // Create input context string with safety checks
+        std::string context = "You are an AI programming assistant. You can run code directly in the terminal.\n\n";
+        context += "Important: When showing commands, use ```bash blocks and write ONLY the exact commands to run.\n";
+        context += "When showing Python code, use ```python blocks.\n";
+        context += "Current working directory: " + current_directory + "\n\n";
         
-        // Build context-aware prompt
-        std::string prompt = "You are an AI programming assistant. ";
-        prompt += "\nCurrent working directory: " + current_directory + "\n";
-        
-        // Add directory contents information
-        prompt += "\nFiles in current directory:\n";
+        // Add directory listing
+        context += "Files in current directory:\n";
         for (const auto& entry : current_directory_files) {
-            std::string name = entry.path().filename().string();
-            if (entry.is_directory()) {
-                prompt += "[DIR] " + name + "/\n";
-            } else {
-                prompt += "[FILE] " + name + "\n";
-                // If it's a recognized text file, add its content
-                std::string ext = entry.path().extension().string();
-                if (isRecognizedFileType(ext)) {
-                    try {
-                        std::string content = readFile(entry.path().string());
-                        if (content.length() < 10000) {  // Only include smaller files
-                            prompt += "Content of " + name + ":\n```\n" + content + "\n```\n";
-                        } else {
-                            prompt += "(File too large to include content)\n";
+            context += (entry.is_directory() ? "[DIR] " : "[FILE] ") + 
+                      entry.path().filename().string() + "\n";
+        }
+        
+        // Add editor context
+        context += "\n" + std::string(editor.isFileOpen() ? 
+            "Current file: " + editor.getCurrentFile() : 
+            "No file is currently open.");
+
+        std::string response = groq_client.getCompletion(context + "\n\n" + query);
+        
+        // Process code blocks and execute them
+        size_t pos = 0;
+        while ((pos = response.find("```", pos)) != std::string::npos) {
+            // Find the block type
+            size_t type_end = response.find('\n', pos);
+            if (type_end == std::string::npos) break;
+            
+            std::string block_type = response.substr(pos + 3, type_end - (pos + 3));
+            // Remove any whitespace or extra characters
+            block_type = block_type.substr(0, block_type.find_first_of(" \t\r\n"));
+            
+            // Find the end of the code block
+            size_t start = type_end + 1;
+            size_t end = response.find("```", start);
+            if (end == std::string::npos) break;
+            
+            // Extract and clean the code/command
+            std::string content = response.substr(start, end - start);
+            // Trim whitespace and newlines
+            while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) {
+                content.pop_back();
+            }
+            while (!content.empty() && (content.front() == '\n' || content.front() == '\r')) {
+                content.erase(0, 1);
+            }
+            
+            if (!content.empty()) {
+                if (block_type == "python") {
+                    // Generate a unique filename for the Python script
+                    std::string filename = "ai_script_" + 
+                        std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + 
+                        ".py";
+                    
+                    // Execute the Python code
+                    executeAIGeneratedCode(content, filename);
+                } else if (block_type == "bash") {
+                    // Split and execute each command line
+                    std::istringstream command_stream(content);
+                    std::string command;
+                    while (std::getline(command_stream, command)) {
+                        // Trim whitespace
+                        command.erase(0, command.find_first_not_of(" \t\r\n"));
+                        command.erase(command.find_last_not_of(" \t\r\n") + 1);
+                        
+                        if (!command.empty()) {
+                            executeTerminalCommand(command);
+                            // Add a small delay between commands
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         }
-                    } catch (...) {
-                        // Ignore files we can't read
                     }
                 }
             }
-        }
-
-        if (!currentFileName.empty()) {
-            // Determine if we're working with a Python file
-            bool isPythonFile = false;
-            std::string fileExtension;
-            size_t dot_pos = currentFileName.find_last_of('.');
-            if (dot_pos != std::string::npos) {
-                fileExtension = currentFileName.substr(dot_pos);
-                isPythonFile = (fileExtension == ".py");
-            }
-
-            // Build context-aware prompt
-            prompt += "You can modify the file content directly. ";
             
-            if (isPythonFile) {
-                prompt += "\nThis is a Python file. Please ensure suggestions follow PEP 8 style guidelines ";
-                prompt += "and Python best practices. Consider proper indentation and Python-specific patterns.\n";
-            }
-            
-            // Add file context
-            prompt += "\nCurrent file: " + currentFileName;
-            prompt += " (." + fileExtension + " file)";
-            
-            // Add the file content with cursor position marker
-            std::string contentWithCursor = std::string(fileContent);
-            contentWithCursor.insert(cursorPos, "<!CURSOR!>");
-            prompt += "\n\nFile content (<!CURSOR!> marks cursor position):\n```";
-            prompt += isPythonFile ? "python" : ""; // Specify language for better formatting
-            prompt += "\n" + contentWithCursor + "\n```\n\n";
-            
-            prompt += "Cursor position: " + std::to_string(cursorPos) + "\n\n";
-
-            // Add edit instructions
-            prompt += "\nYou can modify the file using these commands:\n";
-            prompt += "1. To insert at cursor: <INSERT>new code</INSERT>\n";
-            prompt += "2. To replace text: <REPLACE start=X end=Y>new code</REPLACE>\n";
-            prompt += "3. To delete text: <DELETE start=X end=Y>\n";
-            prompt += "4. To create new files: <NEW_FILE path=\"filename\">content</NEW_FILE>\n\n";
-            
-        } else {
-            // Add special handling for no file open
-            prompt += "\nNo file is currently open. I can help you:\n";
-            prompt += "1. Create a new file in the current directory using: <NEW_FILE path=\"filename.ext\">content</NEW_FILE>\n";
-            prompt += "2. Create a new project in the current directory\n";
-            prompt += "3. Set up project structure and build files\n\n";
-            
-            // Add project templates hint if query suggests creating a project
-            if (query.find("create project") != std::string::npos || 
-                query.find("new project") != std::string::npos ||
-                query.find("setup project") != std::string::npos) {
-                    
-                prompt += "Available project templates:\n";
-                prompt += "- C++ project (CMake based)\n";
-                prompt += "- Python project (with virtual environment)\n";
-                prompt += "- Web project (HTML/CSS/JS)\n";
-                prompt += "\nI'll create all necessary files in the current directory: " + current_directory + "\n";
-            }
-        }
-
-        // Add terminal command instructions to the prompt
-        prompt += "\nYou can execute terminal commands using: <TERMINAL>command</TERMINAL>\n";
-        prompt += "For example:\n";
-        prompt += "- <TERMINAL>python3 script.py</TERMINAL>\n";
-        prompt += "- <TERMINAL>g++ file.cpp -o program && ./program</TERMINAL>\n";
-        prompt += "- <TERMINAL>ls</TERMINAL>\n\n";
-
-        // Add write file instructions to the prompt
-        prompt += "\nYou can write to any file using: <WRITE_FILE path=\"filename\">content</WRITE_FILE>\n";
-        prompt += "This will write the content to the file even if it's not currently open.\n";
-
-        // Get the AI response
-        std::string response = groq_client.getCompletion(prompt + "\n\nUser: " + query);
-        bool made_changes = false;
-
-        // Handle terminal commands
-        size_t terminal_pos = 0;
-        while ((terminal_pos = response.find("<TERMINAL>", terminal_pos)) != std::string::npos) {
-            size_t end_pos = response.find("</TERMINAL>", terminal_pos);
-            if (end_pos != std::string::npos) {
-                std::string command = response.substr(terminal_pos + 10, end_pos - (terminal_pos + 10));
-                
-                // Add command to terminal history
-                terminal_history.push_back("> " + command);
-                
-                // Execute the command
-                executeTerminalCommand(command);
-                made_changes = true;
-            }
-            terminal_pos = end_pos;
-        }
-
-        // Handle file modifications if a file is open
-        if (editor.isFileOpen()) {
-            // Handle INSERT tags
-            size_t insert_pos = 0;
-            while ((insert_pos = response.find("<INSERT>", insert_pos)) != std::string::npos) {
-                size_t end_pos = response.find("</INSERT>", insert_pos);
-                if (end_pos != std::string::npos) {
-                    std::string code = response.substr(insert_pos + 8, end_pos - (insert_pos + 8));
-                    editor.insertAtCursor(code);
-                    made_changes = true;
-                }
-                insert_pos = end_pos;
-            }
-
-            // Handle REPLACE tags
-            size_t replace_pos = 0;
-            while ((replace_pos = response.find("<REPLACE", replace_pos)) != std::string::npos) {
-                size_t start_attr = response.find("start=", replace_pos) + 6;
-                size_t end_attr = response.find("end=", replace_pos) + 4;
-                size_t close_tag = response.find(">", replace_pos);
-                size_t end_tag = response.find("</REPLACE>", close_tag);
-                
-                if (start_attr != std::string::npos && end_attr != std::string::npos && 
-                    close_tag != std::string::npos && end_tag != std::string::npos) {
-                    
-                    size_t start_pos = std::stoul(response.substr(start_attr, response.find(" ", start_attr) - start_attr));
-                    size_t end_pos = std::stoul(response.substr(end_attr, response.find(">", end_attr) - end_attr));
-                    std::string new_code = response.substr(close_tag + 1, end_tag - (close_tag + 1));
-                    
-                    editor.replaceText(start_pos, end_pos, new_code);
-                    made_changes = true;
-                }
-                replace_pos = end_tag;
-            }
-
-            // Handle DELETE tags
-            size_t delete_pos = 0;
-            while ((delete_pos = response.find("<DELETE", delete_pos)) != std::string::npos) {
-                size_t start_attr = response.find("start=", delete_pos) + 6;
-                size_t end_attr = response.find("end=", delete_pos) + 4;
-                size_t end_tag = response.find(">", delete_pos);
-                
-                if (start_attr != std::string::npos && end_attr != std::string::npos) {
-                    size_t start_pos = std::stoul(response.substr(start_attr, response.find(" ", start_attr) - start_attr));
-                    size_t end_pos = std::stoul(response.substr(end_attr, response.find(">", end_attr) - end_attr));
-                    
-                    editor.replaceText(start_pos, end_pos, "");
-                    made_changes = true;
-                }
-                delete_pos = end_tag;
-            }
-
-            // Save changes if any modifications were made
-            if (made_changes) {
-                editor.saveFile();
-                response += "\n\nChanges have been applied and saved to the file.";
-            }
-        }
-
-        // Handle NEW_FILE tags
-        size_t file_pos = 0;
-        while ((file_pos = response.find("<NEW_FILE", file_pos)) != std::string::npos) {
-            size_t path_start = response.find("path=\"", file_pos) + 6;
-            size_t path_end = response.find("\"", path_start);
-            size_t close_tag = response.find(">", file_pos);
-            size_t end_tag = response.find("</NEW_FILE>", close_tag);
-            
-            if (path_start != std::string::npos && path_end != std::string::npos && 
-                close_tag != std::string::npos && end_tag != std::string::npos) {
-                
-                std::string filepath = response.substr(path_start, path_end - path_start);
-                std::string content = response.substr(close_tag + 1, end_tag - (close_tag + 1));
-                
-                try {
-                    // Create the file in the current directory
-                    fs::path file_path = fs::path(current_directory) / fs::path(filepath).filename();
-                    
-                    // Create parent directories if needed
-                    if (file_path.has_parent_path()) {
-                        fs::create_directories(file_path.parent_path());
-                    }
-                    
-                    // Write the file
-                    writeFile(file_path.string(), content);
-                    std::cout << "Created new file: " << file_path.string() << std::endl;
-                    made_changes = true;
-                    
-                    // If no file is currently open, open the new file
-                    if (!editor.isFileOpen()) {
-                        editor.openFile(file_path.string());
-                    }
-                    
-                    // Force immediate directory refresh
-                    forceDirectoryRefresh();
-                    
-                } catch (const std::exception& e) {
-                    std::cerr << "Error creating file " << filepath << ": " << e.what() << std::endl;
-                }
-            }
-            file_pos = end_tag;
-        }
-
-        // Handle WRITE_FILE tags
-        size_t write_pos = 0;
-        while ((write_pos = response.find("<WRITE_FILE", write_pos)) != std::string::npos) {
-            size_t path_start = response.find("path=\"", write_pos) + 6;
-            size_t path_end = response.find("\"", path_start);
-            size_t close_tag = response.find(">", write_pos);
-            size_t end_tag = response.find("</WRITE_FILE>", close_tag);
-            
-            if (path_start != std::string::npos && path_end != std::string::npos && 
-                close_tag != std::string::npos && end_tag != std::string::npos) {
-                
-                std::string filepath = response.substr(path_start, path_end - path_start);
-                std::string content = response.substr(close_tag + 1, end_tag - (close_tag + 1));
-                
-                try {
-                    // Create the file in the current directory
-                    fs::path file_path = fs::path(current_directory) / fs::path(filepath).filename();
-                    
-                    // Create parent directories if needed
-                    if (file_path.has_parent_path()) {
-                        fs::create_directories(file_path.parent_path());
-                    }
-                    
-                    // Write the file
-                    writeFile(file_path.string(), content);
-                    std::cout << "Written to file: " << file_path.string() << std::endl;
-                    made_changes = true;
-                    
-                    // Force immediate directory refresh
-                    forceDirectoryRefresh();
-                    
-                } catch (const std::exception& e) {
-                    std::cerr << "Error writing to file " << filepath << ": " << e.what() << std::endl;
-                }
-            }
-            write_pos = end_tag;
-        }
-
-        if (made_changes) {
-            response += "\n\nFiles have been written and directory has been updated.";
+            pos = end + 3;
         }
         
         return response;
         
     } catch (const std::exception& e) {
-        std::cerr << "Exception in getAIAssistance: " << e.what() << std::endl;
+        terminal_history.push_back("Error: " + std::string(e.what()));
         return "Error: " + std::string(e.what());
     }
 }
@@ -598,24 +431,17 @@ void CursorClone::renderGUI() {
     ImGui::Text("Path: %s", getDisplayPath(current_directory).c_str());
     ImGui::Separator();
 
-    // Static variables for state tracking
-    static bool needs_refresh = false;
-    static std::string last_directory;
-    static auto last_refresh_time = std::chrono::steady_clock::now();
+    // Check if we need to refresh
+    static auto last_check_time = std::chrono::steady_clock::now();
+    auto current_time = std::chrono::steady_clock::now();
+    auto time_since_check = std::chrono::duration_cast<std::chrono::milliseconds>(
+        current_time - last_check_time).count();
 
-    // Only refresh directory when needed and not too frequently
-    auto refresh_check_time = std::chrono::steady_clock::now();
-    auto time_since_refresh = std::chrono::duration_cast<std::chrono::milliseconds>(refresh_check_time - last_refresh_time);
-
-    if (current_directory != last_directory && time_since_refresh.count() > 500) {
-        needs_refresh = true;
-        last_directory = current_directory;
-        last_refresh_time = refresh_check_time;
-    }
-
-    if (needs_refresh) {
+    // Refresh directory listing periodically and when needed
+    if (needs_refresh || time_since_check > 500) {  // Check every 500ms
         loadDirectoryQuick(current_directory);
         needs_refresh = false;
+        last_check_time = current_time;
     }
 
     // File list
@@ -669,7 +495,7 @@ void CursorClone::renderGUI() {
     ImGui::EndChild();
 
     // Terminal takes up the remaining height
-    ImGui::BeginChild("Terminal", ImVec2(0, 0), true);
+    ImGui::BeginChild("Terminal", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true);
     {
         // Show current directory at the top of terminal
         ImGui::TextColored(ImVec4(0.5f, 0.8f, 0.5f, 1.0f), "%s", getDisplayPath(current_directory).c_str());
@@ -708,59 +534,32 @@ void CursorClone::renderGUI() {
             }
 
             ImGui::PushStyleColor(ImGuiCol_Text, color);
-            
-            // Make the text selectable
-            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.3f, 0.3f, 0.3f, 0.7f));
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.4f, 0.4f, 0.4f, 0.7f));
-            ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
+            ImGui::TextWrapped("%s", line.c_str());
+            ImGui::PopStyleColor();
+        }
 
-            // Use Selectable with text wrapping
-            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + wrap_width);
-            ImGui::Selectable(line.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
-            ImGui::PopTextWrapPos();
-
-            // Handle text selection
-            if (ImGui::IsItemHovered()) {
-                if (ImGui::IsMouseClicked(0)) {
-                    ImGui::SetKeyboardFocusHere();
-                }
-                
-                // Handle copy when Ctrl+C is pressed
-                if (ImGui::IsKeyPressed(ImGuiKey_C) && ImGui::GetIO().KeyCtrl) {
-                    ImGui::SetClipboardText(line.c_str());
-                }
+        // Show prompt and input field
+        if (!async_command || !async_command->running || async_command->waiting_for_input) {
+            // Show appropriate prompt based on state
+            if (async_command && async_command->waiting_for_input) {
+                ImGui::TextColored(TerminalColors::Prompt, "> ");
+            } else {
+                std::string prompt = getUsername() + "@" + getHostname() + ":" + getDisplayPath(current_directory) + "$ ";
+                ImGui::TextColored(TerminalColors::Prompt, "%s", prompt.c_str());
             }
-
-            ImGui::PopStyleColor(4);  // Pop all colors
-        }
-
-        // Current input line
-        if (!async_command || !async_command->command_running) {  // Only show command prompt when no command is running
-            // Show the full command prompt
-            std::string prompt = getUsername() + "@" + getHostname() + ":" + getDisplayPath(current_directory) + "$ ";
-            ImGui::PushStyleColor(ImGuiCol_Text, TerminalColors::Prompt);
-            ImGui::TextUnformatted(prompt.c_str());
-            ImGui::PopStyleColor();
-        } else if (async_command && async_command->waiting_for_input) {  // For input prompts, just show the input field
-            ImGui::PushStyleColor(ImGuiCol_Text, TerminalColors::Default);
-            ImGui::TextUnformatted("> ");  // Simple input indicator
-            ImGui::PopStyleColor();
-        }
-
-        // Show input field for both command input and program input
-        if ((!async_command || !async_command->command_running) || 
-            (async_command && async_command->waiting_for_input)) {
+            
             ImGui::SameLine();
             
-            // Calculate remaining width for input
-            float remaining_width = ImGui::GetContentRegionAvail().x;
-            
-            // Input text that appears to be part of the terminal
+            // Input field styling
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
             
+            // Calculate remaining width for input
+            float remaining_width = ImGui::GetContentRegionAvail().x;
             ImGui::SetNextItemWidth(remaining_width);
+            
+            // Handle input
             bool input_received = ImGui::InputText("##TerminalInput", 
                 terminal_buffer, 
                 sizeof(terminal_buffer),
@@ -771,25 +570,35 @@ void CursorClone::renderGUI() {
                 this
             );
 
+            if (input_received && terminal_buffer[0] != '\0') {
+                std::string input(terminal_buffer);
+                
+                if (async_command && async_command->waiting_for_input) {
+                    // Send input to running process
+                    sendInput(input + "\n");
+                    terminal_history.push_back("> " + input);
+                } else {
+                    // Execute as new command
+                    executeCommandAsync(input);
+                    command_history.push_back(input);
+                    if (command_history.size() > MAX_COMMAND_HISTORY) {
+                        command_history.erase(command_history.begin());
+                    }
+                }
+                
+                terminal_buffer[0] = '\0';  // Clear input buffer
+            }
+            
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor();
-
-            // Handle input
-            if (input_received) {
-                std::string command = terminal_buffer;
-                if (!command.empty()) {
-                    if (async_command && async_command->waiting_for_input) {
-                        sendInput(command);
-                    } else if (!async_command || !async_command->command_running) {
-                        executeTerminalCommand(command);
-                    }
-                    terminal_buffer[0] = '\0';
-                }
+            
+            // Auto-focus the input field
+            if (ImGui::IsWindowFocused() && !ImGui::IsAnyItemActive()) {
                 ImGui::SetKeyboardFocusHere(-1);
             }
         }
 
-        // Auto-scroll
+        // Auto-scroll to bottom
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
             ImGui::SetScrollHereY(1.0f);
         }
@@ -811,11 +620,25 @@ void CursorClone::renderGUI() {
     // Chat history
     float chatHistoryHeight = -ImGui::GetFrameHeightWithSpacing() * 2;
     ImGui::BeginChild("ChatHistory", ImVec2(0, chatHistoryHeight), true);
-    ImGui::TextWrapped("%s", chat_history.c_str());
-    
-    // Auto-scroll to bottom when new content is added
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-        ImGui::SetScrollHereY(1.0f);
+    {
+        if (!chat_history.empty()) {
+            try {
+                // Display in chunks to prevent buffer overflow
+                const size_t CHUNK_SIZE = 1024;
+                for (size_t i = 0; i < chat_history.length(); i += CHUNK_SIZE) {
+                    std::string chunk = chat_history.substr(i, CHUNK_SIZE);
+                    ImGui::TextWrapped("%s", chunk.c_str());
+                }
+            } catch (const std::exception& e) {
+                ImGui::TextWrapped("Error displaying chat history: %s", e.what());
+            }
+        }
+        
+        // Auto-scroll to bottom
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+    }
     ImGui::EndChild();
 
     // Input area with improved handling
@@ -827,18 +650,58 @@ void CursorClone::renderGUI() {
     ImGui::SameLine();
     if (ImGui::Button("Send") || input_submitted) {
         if (strlen(input_buffer) > 0) {
-            std::string query = input_buffer;
-            chat_history += "\nYou: " + query + "\n";
-            
-            // Get AI response
-            std::string response = getAIAssistance(query);
-            chat_history += "Assistant: " + response + "\n";
-            
-            // Clear input buffer
-            input_buffer[0] = '\0';
-            
-            // Force scroll to bottom
-            ImGui::SetScrollHereY(1.0f);
+            try {
+                std::string query(input_buffer);
+                
+                // Clear input buffer immediately
+                input_buffer[0] = '\0';
+                
+                // Safely append user query
+                std::string new_message = "\n\nYou: " + query;
+                if (new_message.length() > MAX_MESSAGE_SIZE) {
+                    new_message = new_message.substr(0, MAX_MESSAGE_SIZE) + "... (truncated)";
+                }
+                
+                // Ensure we have space in chat history
+                if (chat_history.length() + new_message.length() > MAX_CHAT_HISTORY) {
+                    // Remove old messages until we have space
+                    size_t remove_pos = chat_history.find("\n\n", chat_history.length() / 2);
+                    if (remove_pos != std::string::npos) {
+                        chat_history = chat_history.substr(remove_pos + 2);
+                    } else {
+                        chat_history.clear();
+                    }
+                }
+                
+                chat_history += new_message;
+                
+                // Get AI response
+                std::string response = getAIAssistance(query);
+                
+                // Safely append AI response
+                if (!response.empty()) {
+                    std::string ai_message = "\n\nAssistant: " + response;
+                    if (ai_message.length() > MAX_MESSAGE_SIZE) {
+                        ai_message = ai_message.substr(0, MAX_MESSAGE_SIZE) + "... (truncated)";
+                    }
+                    
+                    // Check space again for AI response
+                    if (chat_history.length() + ai_message.length() > MAX_CHAT_HISTORY) {
+                        size_t remove_pos = chat_history.find("\n\n", chat_history.length() / 2);
+                        if (remove_pos != std::string::npos) {
+                            chat_history = chat_history.substr(remove_pos + 2);
+                        } else {
+                            chat_history.clear();
+                        }
+                    }
+                    
+                    chat_history += ai_message;
+                }
+                
+            } catch (const std::exception& e) {
+                std::cerr << "Error processing chat: " << e.what() << std::endl;
+                chat_history += "\n\nError: Failed to process request - " + std::string(e.what());
+            }
         }
     }
     
@@ -955,26 +818,57 @@ void CursorClone::navigateToParentDirectory() {
 
 void CursorClone::changeDirectory(const std::string& new_path) {
     try {
-        std::error_code ec;
-        fs::path target_path = fs::absolute(new_path, ec);
-        
-        if (!ec && fs::is_directory(target_path, ec)) {
-            current_directory = target_path.string();
-            loadDirectoryQuick(current_directory);
-            
-            // Force immediate directory refresh
-            needs_refresh = true;
-            last_directory = current_directory;
-            last_refresh_time = std::chrono::steady_clock::now();
-            refreshDirectoryContent();
-            
-            // Update terminal history with new path
-            terminal_history.push_back("Changed directory to: " + getDisplayPath(current_directory));
-        } else {
-            terminal_history.push_back("cd: " + new_path + ": No such directory");
+        if (new_path.empty()) {
+            std::cerr << "Error: Empty path provided" << std::endl;
+            return;
         }
+
+        // Create absolute path safely
+        fs::path path;
+        try {
+            path = fs::absolute(new_path);
+        } catch (const std::exception& e) {
+            std::cerr << "Error resolving path: " << e.what() << std::endl;
+            return;
+        }
+
+        // Check if path exists and is a directory
+        std::error_code ec;
+        if (!fs::exists(path, ec) || !fs::is_directory(path, ec)) {
+            std::cerr << "Error: Path does not exist or is not a directory: " << new_path << std::endl;
+            return;
+        }
+
+        // Try to set current directory
+        try {
+            current_directory = path.string();
+        } catch (const std::exception& e) {
+            std::cerr << "Error setting current directory: " << e.what() << std::endl;
+            return;
+        }
+
+        // Load directory contents safely
+        try {
+            loadDirectoryQuick(current_directory);
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading directory contents: " << e.what() << std::endl;
+            return;
+        }
+        
+        // Only try to update embedding if enabled and client exists
+        if (embeddings_enabled && pinecone_client) {
+            try {
+                updateDirectoryEmbedding(current_directory);
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Failed to update directory embedding: " << e.what() << std::endl;
+                // Continue even if embedding fails
+            }
+        }
+        
     } catch (const std::exception& e) {
-        terminal_history.push_back("Error changing directory: " + std::string(e.what()));
+        std::cerr << "Error changing directory: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Unknown error changing directory" << std::endl;
     }
 }
 
@@ -1013,7 +907,10 @@ void CursorClone::showDirectoryContextMenu(const fs::path& path) {
                 if (file.is_open()) {
                     file.close();
                     editor.openFile(new_file_path.string());
-                    refreshDirectoryContent();
+                    
+                    // Force immediate refresh
+                    forceDirectoryRefresh();
+                    loadDirectoryQuick(current_directory);
                 }
                 new_file_name[0] = '\0';  // Clear the input
                 ImGui::CloseCurrentPopup();
@@ -1039,7 +936,11 @@ void CursorClone::showDirectoryContextMenu(const fs::path& path) {
             try {
                 fs::path new_dir_path = fs::path(current_directory) / new_dir_name;
                 fs::create_directory(new_dir_path);
-                refreshDirectoryContent();
+                
+                // Force immediate refresh
+                forceDirectoryRefresh();
+                loadDirectoryQuick(current_directory);
+                
                 new_dir_name[0] = '\0';  // Clear the input
                 ImGui::CloseCurrentPopup();
             } catch (const std::exception& e) {
@@ -1073,7 +974,7 @@ void CursorClone::showDirectoryContextMenu(const fs::path& path) {
 }
 
 void CursorClone::openSystemDirectoryBrowser() {
-    #if defined(_WIN32)
+    #ifdef _WIN32
         // Windows implementation
         BROWSEINFO bi = { 0 };
         bi.lpszTitle = "Select Directory";
@@ -1097,7 +998,7 @@ void CursorClone::openSystemDirectoryBrowser() {
             char buffer[1024];
             std::string result = "";
             while (!feof(pipe)) {
-                if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                if (fgets(buffer, sizeof(buffer), pipe) {
                     result += buffer;
                 }
             }
@@ -1110,22 +1011,27 @@ void CursorClone::openSystemDirectoryBrowser() {
         }
     #else
         // Linux implementation using zenity
-        std::string command = "zenity --file-selection --directory";
-        FILE* pipe = popen(command.c_str(), "r");
-        if (pipe) {
-            char buffer[1024];
-            std::string result = "";
-            while (!feof(pipe)) {
-                if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                    result += buffer;
-                }
+        FILE* pipe = popen("zenity --file-selection --directory", "r");
+        if (!pipe) {
+            std::cerr << "Error opening directory browser" << std::endl;
+            return;
+        }
+
+        char buffer[1024];
+        std::string result;
+        
+        if (fgets(buffer, sizeof(buffer), pipe)) {
+            result = buffer;
+            // Remove trailing newline if present
+            if (!result.empty() && result.back() == '\n') {
+                result.pop_back();
             }
-            pclose(pipe);
-            if (!result.empty()) {
-                // Remove newline at the end
-                result = result.substr(0, result.length() - 1);
-                changeDirectory(result);
-            }
+        }
+        
+        pclose(pipe);
+        
+        if (!result.empty()) {
+            changeDirectory(result);
         }
     #endif
 }
@@ -1208,7 +1114,6 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
 
         if (command.substr(0, 3) == "cd ") {
             std::string path = command.substr(3);
-            // Trim whitespace
             path.erase(0, path.find_first_not_of(" \t"));
             path.erase(path.find_last_not_of(" \t") + 1);
             
@@ -1220,12 +1125,17 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
             return;
         }
 
-        // Add the command to history with the full prompt
-        std::string prompt = getUsername() + "@" + getHostname() + ":" + getDisplayPath(current_directory) + "$ ";
-        terminal_history.push_back(prompt + command);
-
-        // Execute the command in the current directory
-        executeCommandAsync(command);
+        // For AI-generated code execution, don't add the normal prompt
+        if (terminal_history.size() >= 2 && 
+            terminal_history[terminal_history.size() - 2].find("Script Output") != std::string::npos) {
+            // We're inside the script output box, don't add extra formatting
+            executeCommandAsync(command);
+        } else {
+            // Normal command execution
+            std::string prompt = getUsername() + "@" + getHostname() + ":" + getDisplayPath(current_directory) + "$ ";
+            terminal_history.push_back(prompt + command);
+            executeCommandAsync(command);
+        }
 
     } catch (const std::exception& e) {
         terminal_history.push_back("Error: " + std::string(e.what()));
@@ -1233,255 +1143,147 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
 }
 
 void CursorClone::executeCommandAsync(const std::string& command) {
-    try {
-        // Cancel any existing command
-        if (async_command && async_command->running) {
-            #ifdef _WIN32
-                _pclose(async_command->pipe);
-            #else
-                pclose(async_command->pipe);
-            #endif
-            async_command->pipe = nullptr;
-            async_command->running = false;
-        }
-
-        async_command = std::make_unique<AsyncCommand>();
-        async_command->command = command;
-        async_command->running = true;
-        async_command->command_running = true;  // Set this when starting command
-
-        async_command->future = std::async(std::launch::async, [this, command]() {
-            try {
-                char buffer[4096];  // Use 4KB buffer consistently
-                
-                #ifdef _WIN32
-                    // Windows code...
-                #else
-                    // For Unix, handle Python specially
-                    std::string full_command;
-                    if (command.find("python") != std::string::npos) {
-                        // Extract Python command and arguments
-                        size_t space_pos = command.find(" ");
-                        std::string python_cmd = space_pos != std::string::npos ? 
-                            command.substr(0, space_pos) : command;
-                        std::string args = space_pos != std::string::npos ? 
-                            command.substr(space_pos + 1) : "";
-                            
-                        // Trim whitespace from args
-                        args.erase(0, args.find_first_not_of(" \t"));
-                        
-                        // If it's a .py file, use full path
-                        if (args.find(".py") != std::string::npos) {
-                            fs::path script_path = fs::path(current_directory) / args;
-                            full_command = "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 " + 
-                                         python_cmd + " -u \"" + script_path.string() + "\"";
-                        } else {
-                            full_command = "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 " + 
-                                         python_cmd + " -u " + args;
-                        }
-                    } else {
-                        full_command = command;
-                    }
-
-                    // Create PTY with proper terminal settings
-                    int master, slave;
-                    char name[1024];
-                    
-                    if (openpty(&master, &slave, name, nullptr, nullptr) == -1) {
-                        throw std::runtime_error("Failed to open PTY");
-                    }
-
-                    // Set up terminal attributes for proper output handling
-                    struct termios tios;
-                    tcgetattr(slave, &tios);
-                    cfmakeraw(&tios);  // Use raw mode
-                    tios.c_lflag &= ~(ECHO | ICANON);  // Disable echo and canonical mode
-                    tios.c_cc[VMIN] = 1;   // Read one char at a time
-                    tios.c_cc[VTIME] = 0;  // No timeout
-                    tcsetattr(slave, TCSANOW, &tios);
-
-                    pid_t pid = fork();
-                    if (pid == -1) {
-                        close(master);
-                        close(slave);
-                        throw std::runtime_error("Fork failed");
-                    }
-                    
-                    if (pid == 0) {  // Child process
-                        close(master);
-                        setsid();
-                        dup2(slave, 0);  // stdin
-                        dup2(slave, 1);  // stdout
-                        dup2(slave, 2);  // stderr
-                        close(slave);
-                        
-                        if (chdir(current_directory.c_str()) != 0) {
-                            std::cerr << "Failed to change directory to: " << current_directory << std::endl;
-                            exit(1);
-                        }
-
-                        execl("/bin/bash", "bash", "-c", full_command.c_str(), nullptr);
-                        perror("execl failed");
-                        exit(1);
-                    }
-                    
-                    // Parent process
-                    close(slave);
-                    async_command->master_fd = master;
-                    
-                    // Set non-blocking mode
-                    int flags = fcntl(master, F_GETFL, 0);
-                    fcntl(master, F_SETFL, flags | O_NONBLOCK);
-                    
-                    std::string partial_line;
-                    
-                    while (async_command->running) {
-                        fd_set readfds;
-                        FD_ZERO(&readfds);
-                        FD_SET(master, &readfds);
-                        
-                        struct timeval tv;
-                        tv.tv_sec = 0;
-                        tv.tv_usec = 1000;  // 1ms timeout for more responsive output
-                        
-                        int ret = select(master + 1, &readfds, nullptr, nullptr, &tv);
-                        if (ret > 0) {
-                            ssize_t bytes_read = read(master, buffer, sizeof(buffer) - 1);
-                            if (bytes_read <= 0) {
-                                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            
-                            buffer[bytes_read] = '\0';
-                            
-                            // Immediately add output to terminal history
-                            std::lock_guard<std::mutex> lock(async_command->output_mutex);
-                            std::string output(buffer, bytes_read);
-                            
-                            // Split output into lines
-                            size_t start = 0;
-                            size_t end;
-                            
-                            while ((end = output.find('\n', start)) != std::string::npos) {
-                                std::string line = partial_line + output.substr(start, end - start);
-                                if (!line.empty()) {
-                                    terminal_history.push_back(line);
-                                    
-                                    // Check for input prompts
-                                    if (line.find("input(") != std::string::npos || 
-                                        line.find("Input") != std::string::npos ||
-                                        line.find("Enter") != std::string::npos ||
-                                        line.find(": ") != std::string::npos ||
-                                        line.find("?") != std::string::npos) {
-                                        async_command->waiting_for_input = true;
-                                    }
-                                }
-                                start = end + 1;
-                                partial_line.clear();
-                            }
-                            
-                            // Save any remaining partial line
-                            if (start < output.length()) {
-                                partial_line = output.substr(start);
-                                if (!partial_line.empty()) {
-                                    terminal_history.push_back(partial_line);
-                                    
-                                    // Check if partial line is an input prompt
-                                    if (partial_line.find("input(") != std::string::npos || 
-                                        partial_line.find("Input") != std::string::npos ||
-                                        partial_line.find("Enter") != std::string::npos ||
-                                        partial_line.find(": ") != std::string::npos ||
-                                        partial_line.find("?") != std::string::npos) {
-                                        async_command->waiting_for_input = true;
-                                    }
-                                    partial_line.clear();
-                                }
-                            }
-                        }
-                        
-                        // Small sleep to prevent CPU hogging
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
-                    
-                    close(master);
-                #endif
-
-                // Reset command state only after normal completion
-                async_command->running = false;
-                async_command->command_running = false;
-                async_command->waiting_for_input = false;
-
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lock(async_command->output_mutex);
-                async_command->output_buffer.push_back("Error: " + std::string(e.what()));
-                async_command->running = false;
-                async_command->command_running = false;
-                async_command->waiting_for_input = false;
-            }
-        });
-
-    } catch (const std::exception& e) {
-        terminal_history.push_back("Error launching command: " + std::string(e.what()));
-        if (async_command) {
-            async_command->running = false;
-            async_command->command_running = false;
-            async_command->waiting_for_input = false;
-        }
+    cancelCurrentLoading();  // Cancel any existing command
+    
+    async_command = std::make_unique<AsyncCommand>();
+    async_command->command = command;
+    async_command->running = true;
+    async_command->command_running = true;  // Add this line
+    
+    // Create pipe for input
+    if (pipe(async_command->input_pipe) == -1) {
+        terminal_history.push_back("Error: Failed to create input pipe");
+        return;
     }
+
+    // Create pseudo-terminal
+    async_command->master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (async_command->master_fd == -1) {
+        terminal_history.push_back("Error: Failed to create pseudo-terminal");
+        return;
+    }
+
+    grantpt(async_command->master_fd);
+    unlockpt(async_command->master_fd);
+
+    async_command->future = std::async(std::launch::async, [this, command]() {
+        // First change to the correct directory
+        if (chdir(current_directory.c_str()) != 0) {
+            std::string error = "Failed to change directory: " + std::string(strerror(errno));
+            terminal_history.push_back(error);
+            return;
+        }
+
+        pid_t pid = fork();
+        
+        if (pid == 0) {  // Child process
+            // Set up slave end of PTY
+            int slave_fd = open(ptsname(async_command->master_fd), O_RDWR);
+            
+            // Redirect stdin/stdout/stderr
+            dup2(slave_fd, STDIN_FILENO);
+            dup2(slave_fd, STDOUT_FILENO);
+            dup2(slave_fd, STDERR_FILENO);
+            
+            // Connect input pipe to stdin
+            dup2(async_command->input_pipe[0], STDIN_FILENO);
+            
+            close(async_command->master_fd);
+            close(async_command->input_pipe[0]);
+            close(async_command->input_pipe[1]);
+            
+            // Set up environment
+            setenv("TERM", "xterm-256color", 1);
+            setenv("PYTHONUNBUFFERED", "1", 1);
+            setenv("PYTHONIOENCODING", "utf-8", 1);
+            
+            // Execute the command
+            execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+            perror("execl failed");
+            exit(1);
+        }
+        
+        // Parent process
+        char buffer[1024];
+        fd_set read_fds;
+        
+        while (async_command && async_command->running) {
+            FD_ZERO(&read_fds);
+            FD_SET(async_command->master_fd, &read_fds);
+            
+            struct timeval tv = {0, 100000};  // 100ms timeout
+            
+            int ret = select(async_command->master_fd + 1, &read_fds, nullptr, nullptr, &tv);
+            
+            if (ret > 0 && FD_ISSET(async_command->master_fd, &read_fds)) {
+                ssize_t n = read(async_command->master_fd, buffer, sizeof(buffer) - 1);
+                if (n > 0) {
+                    buffer[n] = '\0';
+                    std::string output(buffer);
+                    
+                    // Check for common input prompts
+                    if (output.find("input(") != std::string::npos ||
+                        output.find("Input") != std::string::npos ||
+                        output.find("Enter") != std::string::npos ||
+                        output.find(": ") != std::string::npos ||
+                        output.find(">>> ") != std::string::npos ||  // Python prompt
+                        output.find("... ") != std::string::npos) {  // Python continuation prompt
+                        async_command->waiting_for_input = true;
+                    }
+                    
+                    std::lock_guard<std::mutex> lock(async_command->output_mutex);
+                    async_command->output_buffer.push_back(output);
+                }
+            }
+
+            // Check if process has terminated
+            int status;
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                async_command->running = false;
+                async_command->command_running = false;
+                break;
+            }
+        }
+    });
 }
 
 void CursorClone::checkCommandOutput() {
     if (!async_command) return;
 
+    // Process any pending output
+    {
+        std::lock_guard<std::mutex> lock(async_command->output_mutex);
+        while (!async_command->output_buffer.empty()) {
+            std::string output = async_command->output_buffer.front();
+            async_command->output_buffer.pop_front();
+            
+            // Split output into lines and add to terminal history
+            std::istringstream stream(output);
+            std::string line;
+            while (std::getline(stream, line)) {
+                // Remove carriage returns and other control characters
+                line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+                if (!line.empty()) {
+                    terminal_history.push_back(line);
+                }
+            }
+        }
+    }
+
     // Check if command has finished
     if (async_command->future.valid() && 
         async_command->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         
-        // Transfer any remaining output
-        {
-            std::lock_guard<std::mutex> lock(async_command->output_mutex);
-            while (!async_command->output_buffer.empty()) {
-                std::string line = async_command->output_buffer.front();
-                
-                // Check if this is an error message
-                if (line.find("Error:") != std::string::npos || 
-                    line.find("exited with code") != std::string::npos) {
-                    // Reset terminal state on error
-                    async_command->waiting_for_input = false;
-                    async_command->command_running = false;
-                }
-                
-                // Process the line
-                if (!line.empty()) {
-                    // Handle carriage return for interactive output
-                    if (line[0] == '\r') {
-                        if (!terminal_history.empty()) {
-                            terminal_history.pop_back();
-                        }
-                        line = line.substr(1);
-                    }
-                    
-                    // Remove trailing whitespace and newlines
-                    while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) {
-                        line.pop_back();
-                    }
-                    
-                    if (!line.empty()) {
-                        terminal_history.push_back(line);
-                    }
-                }
-                
-                async_command->output_buffer.pop_front();
-            }
-        }
-        
-        // Reset command state if not waiting for input
         if (!async_command->waiting_for_input) {
             async_command->running = false;
             async_command->command_running = false;
         }
+    }
+
+    // Limit terminal history size
+    while (terminal_history.size() > MAX_TERMINAL_LINES) {
+        terminal_history.pop_front();
     }
 }
 
@@ -1490,105 +1292,38 @@ static constexpr size_t MAX_TERMINAL_LINES = 1000;
 // Replace the loadDirectoryQuick method with this optimized version
 void CursorClone::loadDirectoryQuick(const std::string& path) {
     try {
-        // Clear existing entries
-        current_directory_files.clear();
-        
-        #ifdef _WIN32
-            // On Windows, if we're in root, show available drives
-            if (path == "C:\\" || path == "/") {
-                DWORD drives = GetLogicalDrives();
-                for (char drive = 'A'; drive <= 'Z'; drive++) {
-                    if (drives & (1 << (drive - 'A'))) {
-                        std::string drive_path = std::string(1, drive) + ":\\";
-                        current_directory_files.push_back(fs::directory_entry(drive_path));
-                    }
-                }
-                return;
-            }
-        #endif
-
-        // Use static cache to persist between calls
-        static std::unordered_map<std::string, std::pair<std::vector<fs::directory_entry>, std::chrono::steady_clock::time_point>> cache;
-        auto now = std::chrono::steady_clock::now();
-        
-        // Check cache first (with 5 second timeout)
-        auto it = cache.find(path);
-        if (it != cache.end()) {
-            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.second).count();
-            if (age < 5) {  // Use cache if less than 5 seconds old
-                current_directory_files = it->second.first;
-                return;
-            }
+        if (path.empty()) {
+            throw std::runtime_error("Empty path provided");
         }
-
-        // Pre-allocate with smaller size
-        std::vector<fs::directory_entry> entries;
-        entries.reserve(50);
 
         std::error_code ec;
-        
-        // Add parent directory entry if not at root
-        #ifdef _WIN32
-            if (path.length() > 3)  // More than just drive letter (e.g., "C:\")
-        #else
-            if (path != "/")
-        #endif
-        {
-            entries.push_back(fs::directory_entry(fs::path(path).parent_path()));
+        fs::path dir_path = fs::absolute(path, ec);
+        if (ec) {
+            throw std::runtime_error("Failed to resolve path: " + ec.message());
         }
 
-        // Use array instead of unordered_set for faster lookup
-        static const std::array<std::string_view, 7> extensions = {
-            ".cpp", ".hpp", ".h", ".py", ".txt", ".json", ".md"
-        };
+        if (!fs::exists(dir_path, ec) || !fs::is_directory(dir_path, ec)) {
+            throw std::runtime_error("Path does not exist or is not a directory");
+        }
 
-        // Single pass through directory with minimal allocations
-        for (const auto& entry : fs::directory_iterator(path, ec)) {
-            if (ec) continue;
-            
-            bool should_add = false;
-            if (entry.is_directory(ec)) {
-                should_add = true;
-            } else {
-                // Fast extension check without string allocation
-                std::string_view ext(entry.path().extension().c_str());
-                for (const auto& valid_ext : extensions) {
-                    if (ext == valid_ext) {
-                        should_add = true;
-                        break;
-                    }
-                }
+        // Clear existing files
+        current_directory_files.clear();
+
+        // Safely iterate directory
+        for (const auto& entry : fs::directory_iterator(dir_path, ec)) {
+            if (ec) {
+                std::cerr << "Warning: Error reading entry: " << ec.message() << std::endl;
+                continue;
             }
-            
-            if (should_add) {
-                entries.push_back(entry);
-            }
+            current_directory_files.push_back(entry);
         }
 
-        // Use stable_partition for better performance with directories
-        auto partition_point = std::stable_partition(entries.begin(), entries.end(),
-            [](const auto& e) { return e.is_directory(); });
-
-        // Sort directories and files separately
-        std::sort(entries.begin(), partition_point,
-            [](const auto& a, const auto& b) {
-                return a.path().filename() < b.path().filename();
-            });
-        std::sort(partition_point, entries.end(),
-            [](const auto& a, const auto& b) {
-                return a.path().filename() < b.path().filename();
-            });
-
-        // Update cache with timestamp
-        if (cache.size() > 5) {
-            cache.clear();
-        }
-        cache[path] = {entries, now};
-        
-        current_directory_files = std::move(entries);
-        
     } catch (const std::exception& e) {
         std::cerr << "Error loading directory: " << e.what() << std::endl;
+        current_directory_files.clear();  // Ensure vector is empty on error
+    } catch (...) {
+        std::cerr << "Unknown error loading directory" << std::endl;
+        current_directory_files.clear();
     }
 }
 
@@ -1655,13 +1390,30 @@ void CursorClone::clearDirectoryCache() {
     directory_cache.clear();
 }
 
-// Add this method to CursorClone class
+// Update the forceDirectoryRefresh method to be more aggressive
 void CursorClone::forceDirectoryRefresh() {
-    needs_refresh = true;
-    last_directory = current_directory;
-    last_refresh_time = std::chrono::steady_clock::now();
-    refreshDirectoryContent();
-    clearDirectoryCache();  // Clear the cache to force a fresh read
+    try {
+        needs_refresh = true;
+        last_directory.clear();  // Clear last directory to force refresh
+        last_refresh_time = std::chrono::steady_clock::now();
+        
+        // Clear the cache
+        clearDirectoryCache();
+        
+        // Immediate refresh
+        loadDirectoryQuick(current_directory);
+        
+        // Schedule multiple refreshes to catch delayed filesystem updates
+        std::thread([this]() {
+            for (int i = 0; i < 3; i++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100 * (i + 1)));
+                needs_refresh = true;
+            }
+        }).detach();
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error during directory refresh: " << e.what() << std::endl;
+    }
 }
 
 // Add this method to show the browse button in the file manager section
@@ -1765,28 +1517,320 @@ void CursorClone::sendInput(const std::string& input) {
         return;
     }
 
+    // Write the input to the pipe
+    if (async_command->input_pipe[1] != -1) {
+        write(async_command->input_pipe[1], input.c_str(), input.length());
+    }
+    async_command->waiting_for_input = false;
+}
+
+void CursorClone::executeAIGeneratedCode(const std::string& code, const std::string& filename) {
     try {
-        std::string input_with_newline = input + "\n";
+        // Add a clear visual separator
+        terminal_history.push_back("\n╔════════════════════════════════════════════════════════════╗");
+        terminal_history.push_back("║                   AI Generated Python Code                   ║");
+        terminal_history.push_back("╠════════════════════════════════════════════════════════════╣");
+        terminal_history.push_back("║ File: " + filename + std::string(50 - filename.length(), ' ') + "║");
+        terminal_history.push_back("╟────────────────────────────────────────────────────────────╢");
         
-        #ifdef _WIN32
-            if (async_command->pipe) {
-                fputs(input_with_newline.c_str(), async_command->pipe);
-                fflush(async_command->pipe);
+        // Display the code in the terminal with line numbers
+        std::istringstream code_stream(code);
+        std::string line;
+        int line_number = 1;
+        while (std::getline(code_stream, line)) {
+            std::string line_num = std::to_string(line_number);
+            line_num = std::string(3 - line_num.length(), '0') + line_num;
+            
+            std::string formatted_line = "║ " + line_num + " │ " + line;
+            if (formatted_line.length() < 54) {
+                formatted_line += std::string(54 - formatted_line.length(), ' ');
             }
-        #else
-            if (async_command->master_fd >= 0) {
-                write(async_command->master_fd, input_with_newline.c_str(), input_with_newline.length());
-            }
+            formatted_line += "║";
+            terminal_history.push_back(formatted_line);
+            line_number++;
+        }
+        
+        terminal_history.push_back("╠════════════════════════════════════════════════════════════╣");
+        terminal_history.push_back("║                      Writing File                           ║");
+        terminal_history.push_back("╚════════════════════════════════════════════════════════════╝\n");
+
+        // Create and write the Python file
+        fs::path script_path = fs::path(current_directory) / filename;
+        std::ofstream file(script_path);
+        if (!file.is_open()) {
+            throw std::runtime_error("Could not create file: " + filename);
+        }
+        file << code;
+        file.close();
+        
+        #if !defined(_WIN32)
+        fs::permissions(script_path, 
+            fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+            fs::perm_options::add);
         #endif
+
+        // Force a directory refresh after creating the file
+        forceDirectoryRefresh();
         
-        // Add the input to terminal history
-        terminal_history.push_back(input);
+        // Add separator for command execution
+        terminal_history.push_back("\n╔════════════════════════════════════════════════════════════╗");
+        terminal_history.push_back("║                    Executing Script                         ║");
+        terminal_history.push_back("╚════════════════════════════════════════════════════════════╝");
         
-        // Reset input state but keep command running
-        async_command->waiting_for_input = false;
-        async_command->command_running = true;
+        // Show the command being executed
+        std::string command = "python3 \"" + script_path.string() + "\"";
+        std::string prompt = getUsername() + "@" + getHostname() + ":" + 
+                           getDisplayPath(current_directory) + "$ ";
+        terminal_history.push_back(prompt + command);
+        
+        // Add separator for script output
+        terminal_history.push_back("\n╔════════════════════════════════════════════════════════════╗");
+        terminal_history.push_back("║                      Script Output                          ║");
+        terminal_history.push_back("╟────────────────────────────────────────────────────────────╢");
+        
+        // Execute the command with input handling
+        std::string full_command = "cd \"" + current_directory + "\" && PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 " + command;
+        
+        int input_pipe[2];  // For writing to the process
+        int output_pipe[2]; // For reading from the process
+        
+        if (pipe(input_pipe) == -1 || pipe(output_pipe) == -1) {
+            throw std::runtime_error("Failed to create pipes");
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            throw std::runtime_error("Failed to fork process");
+        }
+
+        if (pid == 0) {  // Child process
+            close(input_pipe[1]);   // Close write end of input pipe
+            close(output_pipe[0]);  // Close read end of output pipe
+
+            // Redirect stdin to input pipe
+            dup2(input_pipe[0], STDIN_FILENO);
+            // Redirect stdout and stderr to output pipe
+            dup2(output_pipe[1], STDOUT_FILENO);
+            dup2(output_pipe[1], STDERR_FILENO);
+
+            // Close unused pipe ends
+            close(input_pipe[0]);
+            close(output_pipe[1]);
+
+            execl("/bin/bash", "bash", "-c", full_command.c_str(), nullptr);
+            perror("execl failed");
+            exit(1);
+        }
+
+        // Parent process
+        close(input_pipe[0]);   // Close read end of input pipe
+        close(output_pipe[1]);  // Close write end of output pipe
+
+        // Set non-blocking mode for output pipe
+        int flags = fcntl(output_pipe[0], F_GETFL, 0);
+        fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+        bool process_running = true;
+        bool waiting_for_input = false;
+        char buffer[4096];
+        std::string input_buffer;
+
+        while (process_running) {
+            // Check if process has terminated
+            int status;
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                process_running = false;
+            }
+
+            // Read output
+            ssize_t bytes_read = read(output_pipe[0], buffer, sizeof(buffer) - 1);
+            if (bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                std::string output(buffer);
+
+                // Check for input prompts
+                if (output.find("input(") != std::string::npos || 
+                    output.find("Input") != std::string::npos ||
+                    output.find("Enter") != std::string::npos ||
+                    output.find(": ") != std::string::npos) {
+                    waiting_for_input = true;
+                }
+
+                // Format and display output
+                std::istringstream stream(output);
+                std::string line;
+                while (std::getline(stream, line)) {
+                    if (!line.empty()) {
+                        std::string formatted_line = "║ " + line;
+                        if (formatted_line.length() < 54) {
+                            formatted_line += std::string(54 - formatted_line.length(), ' ');
+                        }
+                        formatted_line += "║";
+                        terminal_history.push_back(formatted_line);
+                    }
+                }
+
+                // If waiting for input, show input prompt
+                if (waiting_for_input) {
+                    terminal_history.push_back("║ > ");
+                    handleScriptInput(input_pipe[1]);
+                }
+            }
+
+            // Small sleep to prevent CPU hogging
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Clean up pipes
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+
+        // Add final separator
+        terminal_history.push_back("╚════════════════════════════════════════════════════════════╝\n");
+
+    } catch (const std::exception& e) {
+        terminal_history.push_back("Error executing AI code: " + std::string(e.what()));
+    }
+}
+
+// Add this method to generate embeddings for directories
+std::vector<float> CursorClone::getDirectoryEmbedding(const std::string& path) {
+    if (!embeddings_enabled) return std::vector<float>();
+    
+    try {
+        std::string directory_content;
+        for (const auto& entry : fs::directory_iterator(path)) {
+            std::string entry_type = entry.is_directory() ? "[DIR] " : "[FILE] ";
+            directory_content += entry_type + entry.path().filename().string() + "\n";
+            
+            // Add file metadata if it's a file
+            if (!entry.is_directory()) {
+                auto file_size = entry.file_size();
+                auto last_write = entry.last_write_time();
+                
+                // Convert to time_t in a C++17 compatible way
+                auto duration = last_write.time_since_epoch();
+                auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+                time_t time_t_time = static_cast<time_t>(seconds);
+                
+                directory_content += "  Size: " + std::to_string(file_size) + " bytes\n";
+                directory_content += "  Modified: " + std::string(std::ctime(&time_t_time));
+            }
+        }
+        
+        // Get embedding from Groq
+        return groq_client.getEmbedding(directory_content);
         
     } catch (const std::exception& e) {
-        terminal_history.push_back("Error sending input: " + std::string(e.what()));
+        std::cerr << "Error generating directory embedding: " << e.what() << std::endl;
+        return std::vector<float>();
     }
+}
+
+// Add this method to update Pinecone when directory changes
+void CursorClone::updateDirectoryEmbedding(const std::string& path) {
+    if (!embeddings_enabled) return;
+    
+    try {
+        std::string directory_content;
+        for (const auto& entry : fs::directory_iterator(path)) {
+            std::string entry_type = entry.is_directory() ? "[DIR] " : "[FILE] ";
+            directory_content += entry_type + entry.path().filename().string() + "\n";
+            
+            // Add file metadata if it's a file
+            if (!entry.is_directory()) {
+                auto file_size = entry.file_size();
+                auto last_write = entry.last_write_time();
+                
+                // Convert to time_t in a C++17 compatible way
+                auto duration = last_write.time_since_epoch();
+                auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+                time_t time_t_time = static_cast<time_t>(seconds);
+                
+                directory_content += "  Size: " + std::to_string(file_size) + " bytes\n";
+                directory_content += "  Modified: " + std::string(std::ctime(&time_t_time));
+            }
+        }
+        
+        // Generate a unique ID for the directory
+        std::string id = "dir_" + std::to_string(std::hash<std::string>{}(path));
+        
+        // Create metadata
+        nlohmann::json metadata = {
+            {"path", path},
+            {"last_updated", std::chrono::system_clock::now().time_since_epoch().count()},
+            {"file_count", std::distance(fs::directory_iterator(path), fs::directory_iterator())},
+            {"parent", fs::path(path).parent_path().string()}
+        };
+        
+        // Update Pinecone
+        pinecone_client->upsertText(id, directory_content, metadata);
+        
+        std::cout << "Updated embedding for directory: " << path << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error updating directory embedding: " << e.what() << std::endl;
+    }
+}
+
+// Add this method to find similar directories
+void CursorClone::findSimilarDirectories(const std::string& path, int top_k) {
+    if (!embeddings_enabled) return;
+    
+    try {
+        std::string directory_content;
+        for (const auto& entry : fs::directory_iterator(path)) {
+            std::string entry_type = entry.is_directory() ? "[DIR] " : "[FILE] ";
+            directory_content += entry_type + entry.path().filename().string() + "\n";
+        }
+        
+        pinecone_client->queryText(directory_content, top_k);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error finding similar directories: " << e.what() << std::endl;
+    }
+}
+
+// Add this method to the CursorClone class to handle script input
+void CursorClone::handleScriptInput(int input_pipe) {
+    static char input_buffer[1024] = "";
+    static bool input_active = false;
+    
+    // Only show input field when waiting for input
+    if (!input_active) {
+        ImGui::SetKeyboardFocusHere();
+        input_active = true;
+    }
+
+    // Create an input field that matches the terminal style
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+    
+    if (ImGui::InputText("##ScriptInput", input_buffer, sizeof(input_buffer),
+        ImGuiInputTextFlags_EnterReturnsTrue)) {
+        // Format and display the input
+        std::string formatted_input = "║ > " + std::string(input_buffer);
+        if (formatted_input.length() < 54) {
+            formatted_input += std::string(54 - formatted_input.length(), ' ');
+        }
+        formatted_input += "║";
+        terminal_history.push_back(formatted_input);
+        
+        // Send input to the process
+        std::string input_str = std::string(input_buffer) + "\n";
+        write(input_pipe, input_str.c_str(), input_str.length());
+        
+        // Clear the input buffer
+        input_buffer[0] = '\0';
+        input_active = false;
+    }
+    
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+// Add new method to check if command is waiting for input
+bool CursorClone::isWaitingForInput() const {
+    return async_command && async_command->waiting_for_input;
 } 

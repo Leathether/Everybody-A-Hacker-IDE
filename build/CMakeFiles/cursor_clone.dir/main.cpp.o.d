@@ -321,6 +321,7 @@ CMakeFiles/cursor_clone.dir/main.cpp.o: \
  /usr/include/nlohmann/detail/macro_unscope.hpp \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
  /home/leathether/Documents/Projects/text_editor.hpp \
+ /home/leathether/Documents/Projects/pinecone_client.hpp \
  /usr/include/c++/11/unordered_set \
  /usr/include/c++/11/bits/unordered_set.h /usr/include/c++/11/thread \
  /usr/include/c++/11/bits/std_thread.h \

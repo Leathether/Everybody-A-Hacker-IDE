@@ -11,6 +11,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/leathether/Documents/Projects/cursor_clone.cpp" "CMakeFiles/cursor_clone.dir/cursor_clone.cpp.o" "gcc" "CMakeFiles/cursor_clone.dir/cursor_clone.cpp.o.d"
   "/home/leathether/Documents/Projects/groq_client.cpp" "CMakeFiles/cursor_clone.dir/groq_client.cpp.o" "gcc" "CMakeFiles/cursor_clone.dir/groq_client.cpp.o.d"
   "/home/leathether/Documents/Projects/main.cpp" "CMakeFiles/cursor_clone.dir/main.cpp.o" "gcc" "CMakeFiles/cursor_clone.dir/main.cpp.o.d"
+  "/home/leathether/Documents/Projects/pinecone_client.cpp" "CMakeFiles/cursor_clone.dir/pinecone_client.cpp.o" "gcc" "CMakeFiles/cursor_clone.dir/pinecone_client.cpp.o.d"
   "/home/leathether/Documents/Projects/text_editor.cpp" "CMakeFiles/cursor_clone.dir/text_editor.cpp.o" "gcc" "CMakeFiles/cursor_clone.dir/text_editor.cpp.o.d"
   )
 

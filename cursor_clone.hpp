@@ -3,6 +3,7 @@
 #include <string>
 #include "groq_client.hpp"
 #include "text_editor.hpp"
+#include "pinecone_client.hpp"
 #include <imgui.h>
 #include <filesystem>
 #include <unordered_set>
@@ -30,8 +31,10 @@ namespace fs = std::filesystem;
 
 class CursorClone {
 private:
-    // Add this at the top of the private section
+    // Add these constants at the top of the private section
     static constexpr size_t MAX_TERMINAL_LINES = 1000;
+    static constexpr size_t MAX_CHAT_HISTORY = 100000;  // 100KB limit
+    static constexpr size_t MAX_MESSAGE_SIZE = 10000;   // 10KB per message
     
     GroqClient groq_client;
     TextEditor editor;
@@ -113,21 +116,16 @@ private:
 
     // Add to private section of CursorClone class:
     struct AsyncCommand {
-        std::future<void> future;
-        FILE* pipe;
-        bool running;
-        bool command_running;
         std::string command;
+        FILE* pipe = nullptr;
+        int master_fd = -1;
+        int input_pipe[2] = {-1, -1};  // Changed to array for read/write pipe
+        bool running = false;
+        bool command_running = false;
+        bool waiting_for_input = false;
+        std::future<void> future;
         std::deque<std::string> output_buffer;
         std::mutex output_mutex;
-        int master_fd;
-        bool waiting_for_input;
-        
-        AsyncCommand() : pipe(nullptr), 
-                        running(false), 
-                        command_running(false),
-                        master_fd(-1), 
-                        waiting_for_input(false) {}
     };
 
     // Add the sendInput method declaration
@@ -150,6 +148,23 @@ private:
 
     std::string getUsername();
     std::string getHostname();
+
+    // Method to execute AI generated code
+    void executeAIGeneratedCode(const std::string& code, const std::string& filename);
+
+    // Add to private section:
+    bool embeddings_enabled = false;
+    std::unique_ptr<PineconeClient> pinecone_client;
+    std::vector<float> getDirectoryEmbedding(const std::string& path);
+    void updateDirectoryEmbedding(const std::string& path);
+
+    void findSimilarDirectories(const std::string& path, int top_k = 5);
+
+    // Add this method declaration
+    void handleScriptInput(int input_pipe);
+
+    // Add new method to check if command is waiting for input
+    bool isWaitingForInput() const;
 
 public:
     CursorClone(const std::string& api_key);

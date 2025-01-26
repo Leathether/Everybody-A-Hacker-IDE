@@ -382,6 +382,30 @@ main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/cursor_clone.dir/build.make CMakeFiles/cursor_clone.dir/main.cpp.s
 .PHONY : main.cpp.s
 
+pinecone_client.o: pinecone_client.cpp.o
+.PHONY : pinecone_client.o
+
+# target to build an object file
+pinecone_client.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/cursor_clone.dir/build.make CMakeFiles/cursor_clone.dir/pinecone_client.cpp.o
+.PHONY : pinecone_client.cpp.o
+
+pinecone_client.i: pinecone_client.cpp.i
+.PHONY : pinecone_client.i
+
+# target to preprocess a source file
+pinecone_client.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/cursor_clone.dir/build.make CMakeFiles/cursor_clone.dir/pinecone_client.cpp.i
+.PHONY : pinecone_client.cpp.i
+
+pinecone_client.s: pinecone_client.cpp.s
+.PHONY : pinecone_client.s
+
+# target to generate assembly for a file
+pinecone_client.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/cursor_clone.dir/build.make CMakeFiles/cursor_clone.dir/pinecone_client.cpp.s
+.PHONY : pinecone_client.cpp.s
+
 text_editor.o: text_editor.cpp.o
 .PHONY : text_editor.o
 
@@ -446,6 +470,9 @@ help:
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"
+	@echo "... pinecone_client.o"
+	@echo "... pinecone_client.i"
+	@echo "... pinecone_client.s"
 	@echo "... text_editor.o"
 	@echo "... text_editor.i"
 	@echo "... text_editor.s"

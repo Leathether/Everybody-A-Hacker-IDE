@@ -36,6 +36,7 @@ add_executable(cursor_clone
     groq_client.cpp
     text_editor.cpp
     cursor_clone.cpp
+    pinecone_client.cpp
 )
 
 # Add include directories for the executable
