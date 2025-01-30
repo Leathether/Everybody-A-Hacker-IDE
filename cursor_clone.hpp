@@ -166,6 +166,15 @@ private:
     // Add new method to check if command is waiting for input
     bool isWaitingForInput() const;
 
+    // Add to private section of CursorClone class
+    std::vector<std::string> directory_history;
+    size_t current_history_index = 0;
+    static constexpr size_t MAX_DIRECTORY_HISTORY = 50;
+
+    // Add these method declarations in the private section
+    void goBack();
+    void goForward();
+
 public:
     CursorClone(const std::string& api_key);
     ~CursorClone();
