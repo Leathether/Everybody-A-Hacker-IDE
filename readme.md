@@ -2,10 +2,11 @@ This is Everybody A Hacker IDE, and this is the first beta release.
 I will release a youtube video on the 30th of January 2025.
 The goal of this is to make a IDE that AI will make the code for you.
 This is to democritize coding, in order to lower the barrier to entry for people to code.
+Youtube URL:  https://youtu.be/oUMm0oQ_3rs
 
 
 To get the AI to work, you have go to the GROQ website and get an API key. Don't worry, it's free.
-Navigate to th buid folder and write "export GROQ_API_KEY=your_api_key_here" in the terminal.
+Navigate to the build folder and write "export GROQ_API_KEY=your_api_key_here" in the terminal.
 run ./cursor_clone in the terminal.
 
 
