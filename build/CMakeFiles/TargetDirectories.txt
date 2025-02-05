@@ -1,4 +1,4 @@
-/home/leathether/Documents/Projects/build/CMakeFiles/imgui.dir
-/home/leathether/Documents/Projects/build/CMakeFiles/cursor_clone.dir
-/home/leathether/Documents/Projects/build/CMakeFiles/edit_cache.dir
-/home/leathether/Documents/Projects/build/CMakeFiles/rebuild_cache.dir
+/home/masterhacker2019/Everybody-A-Hacker-IDE/build/CMakeFiles/imgui.dir
+/home/masterhacker2019/Everybody-A-Hacker-IDE/build/CMakeFiles/cursor_clone.dir
+/home/masterhacker2019/Everybody-A-Hacker-IDE/build/CMakeFiles/edit_cache.dir
+/home/masterhacker2019/Everybody-A-Hacker-IDE/build/CMakeFiles/rebuild_cache.dir
