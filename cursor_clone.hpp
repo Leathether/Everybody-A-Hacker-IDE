@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <lmcons.h> // For UNLEN
+#include <shobjidl.h>
 #else
 #include <unistd.h>
 #include <limits.h>

@@ -336,8 +336,12 @@ std::string CursorClone::getAIAssistance(const std::string& query) {
 
         std::string response = groq_client.getCompletion(context + "\n\n" + query);
         
+        // Add a simple separator
+        terminal_history.push_back("\n--- AI Assistant Response ---");
+        
         // Process code blocks and execute them
         size_t pos = 0;
+        bool first_command = true;
         while ((pos = response.find("```", pos)) != std::string::npos) {
             // Find the block type
             size_t type_end = response.find('\n', pos);
@@ -364,34 +368,59 @@ std::string CursorClone::getAIAssistance(const std::string& query) {
             
             if (!content.empty()) {
                 if (block_type == "python") {
+                    // If not the first command, add a delay
+                    if (!first_command) {
+                        terminal_history.push_back("Waiting before next command...");
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
+                    
                     // Generate a unique filename for the Python script
                     std::string filename = "ai_script_" + 
                         std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + 
                         ".py";
                     
+                    terminal_history.push_back("Running Python script: " + filename);
                     // Execute the Python code
                     executeAIGeneratedCode(content, filename);
+                    
                 } else if (block_type == "bash") {
                     // Split and execute each command line
                     std::istringstream command_stream(content);
                     std::string command;
+                    bool first_line = true;
+                    
                     while (std::getline(command_stream, command)) {
                         // Trim whitespace
                         command.erase(0, command.find_first_not_of(" \t\r\n"));
                         command.erase(command.find_last_not_of(" \t\r\n") + 1);
                         
                         if (!command.empty()) {
-                            executeTerminalCommand(command);
-                            // Add a small delay between commands
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            // If not the first command overall or first line, add a delay
+                            if (!first_command || !first_line) {
+                                terminal_history.push_back("Waiting before next command...");
+                                std::this_thread::sleep_for(std::chrono::seconds(2));
+                            }
+                            
+                            terminal_history.push_back("$ " + command);
+                            executeCommandAsync(command);
+                            
+                            // Wait for the command to complete
+                            while (async_command && async_command->running) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                checkCommandOutput();
+                            }
+                            
+                            first_line = false;
                         }
                     }
                 }
+                first_command = false;
             }
             
             pos = end + 3;
         }
         
+        terminal_history.push_back("--- End of AI Response ---\n");
         return response;
         
     } catch (const std::exception& e) {
@@ -1025,43 +1054,101 @@ void CursorClone::showDirectoryContextMenu(const fs::path& path) {
 
 void CursorClone::openSystemDirectoryBrowser() {
     #ifdef _WIN32
-        // Windows implementation
-        BROWSEINFO bi = { 0 };
-        bi.lpszTitle = "Select Directory";
-        LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
-        if (pidl != 0) {
-            char path[MAX_PATH];
-            if (SHGetPathFromIDList(pidl, path)) {
-                changeDirectory(path);
+        // Windows implementation using modern Common Item Dialog
+        #include <windows.h>
+        #include <shobjidl.h> 
+        
+        // Initialize COM
+        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (FAILED(hr))
+            return;
+
+        IFileOpenDialog *pFileOpen;
+        hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL, 
+                            IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
+
+        if (SUCCEEDED(hr)) {
+            // Set options to pick folders
+            FILEOPENDIALOGOPTIONS options;
+            pFileOpen->GetOptions(&options);
+            pFileOpen->SetOptions(options | FOS_PICKFOLDERS);
+            
+            // Show the dialog
+            hr = pFileOpen->Show(NULL);
+
+            if (SUCCEEDED(hr)) {
+                IShellItem *pItem;
+                hr = pFileOpen->GetResult(&pItem);
+                if (SUCCEEDED(hr)) {
+                    PWSTR pszFilePath;
+                    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath);
+                    if (SUCCEEDED(hr)) {
+                        // Convert wide string to regular string and change directory
+                        std::wstring ws(pszFilePath);
+                        std::string path(ws.begin(), ws.end());
+                        changeDirectory(path);
+                        CoTaskMemFree(pszFilePath);
+                    }
+                    pItem->Release();
+                }
             }
-            IMalloc* imalloc = 0;
-            if (SUCCEEDED(SHGetMalloc(&imalloc))) {
-                imalloc->Free(pidl);
-                imalloc->Release();
-            }
+            pFileOpen->Release();
         }
+        CoUninitialize();
+        
     #elif defined(__APPLE__)
-        // macOS implementation
-        std::string command = "osascript -e 'choose folder with prompt \"Select Directory\"'";
+        // macOS implementation using NSOpenPanel via AppleScript
+        std::string command = "osascript -e 'tell application \"System Events\"' "
+                            "-e 'activate' "
+                            "-e 'set folderPath to choose folder with prompt \"Select Directory\"' "
+                            "-e 'POSIX path of folderPath' "
+                            "-e 'end tell'";
+                            
         FILE* pipe = popen(command.c_str(), "r");
         if (pipe) {
             char buffer[1024];
-            std::string result = "";
-            while (!feof(pipe)) {
-                if (fgets(buffer, sizeof(buffer), pipe) {
-                    result += buffer;
-                }
+            std::string result;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                result += buffer;
             }
             pclose(pipe);
+            
+            // Clean up the result (remove newlines and quotes)
             if (!result.empty()) {
-                // Remove newline at the end
-                result = result.substr(0, result.length() - 1);
-                changeDirectory(result);
+                result.erase(std::remove(result.begin(), result.end(), '\n'), result.end());
+                result.erase(std::remove(result.begin(), result.end(), '"'), result.end());
+                if (!result.empty()) {
+                    changeDirectory(result);
+                }
             }
         }
+        
     #else
-        // Linux implementation using zenity
-        FILE* pipe = popen("zenity --file-selection --directory", "r");
+        // Linux implementation using native dialog (zenity/kdialog/qarma)
+        std::string dialog_cmd;
+        
+        // Try to detect the desktop environment
+        const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+        const char* session = std::getenv("DESKTOP_SESSION");
+        
+        if (desktop && strcasestr(desktop, "KDE") != nullptr) {
+            // KDE - use kdialog
+            dialog_cmd = "kdialog --getexistingdirectory .";
+        } else if (system("which zenity >/dev/null 2>&1") == 0) {
+            // GNOME/Unity/Others with zenity
+            dialog_cmd = "zenity --file-selection --directory";
+        } else if (system("which qarma >/dev/null 2>&1") == 0) {
+            // Fallback to qarma (Qt clone of zenity)
+            dialog_cmd = "qarma --file-selection --directory";
+        } else if (system("which yad >/dev/null 2>&1") == 0) {
+            // Fallback to yad (another zenity alternative)
+            dialog_cmd = "yad --file --directory";
+        } else {
+            // If no GUI dialog is available, use terminal-based dialog
+            dialog_cmd = "dialog --stdout --title \"Select Directory\" --dselect . 0 0";
+        }
+        
+        FILE* pipe = popen(dialog_cmd.c_str(), "r");
         if (!pipe) {
             std::cerr << "Error opening directory browser" << std::endl;
             return;
@@ -1070,18 +1157,22 @@ void CursorClone::openSystemDirectoryBrowser() {
         char buffer[1024];
         std::string result;
         
-        if (fgets(buffer, sizeof(buffer), pipe)) {
-            result = buffer;
-            // Remove trailing newline if present
-            if (!result.empty() && result.back() == '\n') {
-                result.pop_back();
-            }
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            result += buffer;
         }
         
         pclose(pipe);
         
+        // Clean up the result
         if (!result.empty()) {
-            changeDirectory(result);
+            // Remove trailing newline if present
+            while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+                result.pop_back();
+            }
+            
+            if (!result.empty()) {
+                changeDirectory(result);
+            }
         }
     #endif
 }
@@ -1478,64 +1569,7 @@ void CursorClone::forceDirectoryRefresh() {
 // Add this method to show the browse button in the file manager section
 void CursorClone::showBrowseButton() {
     if (ImGui::Button("Browse")) {
-        ImGui::OpenPopup("BrowsePopup");
-    }
-
-    if (ImGui::BeginPopup("BrowsePopup")) {
-        // Root directory option
-        if (ImGui::MenuItem("Root Directory")) {
-            #ifdef _WIN32
-                changeDirectory("C:\\");
-            #else
-                changeDirectory("/");
-            #endif
-        }
-        
-        // Home directory option
-        if (ImGui::MenuItem("Home Directory")) {
-            changeDirectory(getHomeDirectory());
-        }
-        
-        // Desktop directory option
-        if (ImGui::MenuItem("Desktop")) {
-            std::string desktop = getHomeDirectory();
-            #ifdef _WIN32
-                desktop += "\\Desktop";
-            #else
-                desktop += "/Desktop";
-            #endif
-            if (fs::exists(desktop)) {
-                changeDirectory(desktop);
-            }
-        }
-        
-        // Documents directory option
-        if (ImGui::MenuItem("Documents")) {
-            std::string docs = getHomeDirectory();
-            #ifdef _WIN32
-                docs += "\\Documents";
-            #else
-                docs += "/Documents";
-            #endif
-            if (fs::exists(docs)) {
-                changeDirectory(docs);
-            }
-        }
-        
-        // Downloads directory option
-        if (ImGui::MenuItem("Downloads")) {
-            std::string downloads = getHomeDirectory();
-            #ifdef _WIN32
-                downloads += "\\Downloads";
-            #else
-                downloads += "/Downloads";
-            #endif
-            if (fs::exists(downloads)) {
-                changeDirectory(downloads);
-            }
-        }
-
-        ImGui::EndPopup();
+        openSystemDirectoryBrowser();  // Directly call the native file dialog
     }
 }
 
