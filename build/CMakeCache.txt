@@ -243,13 +243,13 @@ OPENGL_GLX_INCLUDE_DIR:PATH=/usr/include
 OPENGL_INCLUDE_DIR:PATH=/usr/include
 
 //Path to a library.
-OPENGL_egl_LIBRARY:FILEPATH=/tmp/.mount_cursor9Xxfd3/libEGL.so
+OPENGL_egl_LIBRARY:FILEPATH=/tmp/.mount_cursorj1uKwH/libEGL.so
 
 //Path to a library.
-OPENGL_gles2_LIBRARY:FILEPATH=/tmp/.mount_cursor9Xxfd3/libGLESv2.so
+OPENGL_gles2_LIBRARY:FILEPATH=/tmp/.mount_cursorj1uKwH/libGLESv2.so
 
 //Path to a library.
-OPENGL_gles3_LIBRARY:FILEPATH=/tmp/.mount_cursor9Xxfd3/libGLESv2.so
+OPENGL_gles3_LIBRARY:FILEPATH=/tmp/.mount_cursorj1uKwH/libGLESv2.so
 
 //Path to a library.
 OPENGL_glu_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libGLU.so

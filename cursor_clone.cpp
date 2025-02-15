@@ -1241,6 +1241,12 @@ void CursorClone::navigateCommandHistory(bool up) {
 
 void CursorClone::executeTerminalCommand(const std::string& command) {
     try {
+        // Check if a command is already running
+        if (async_command && async_command->running) {
+            terminal_history.push_back("Error: A command is already running. Please wait for it to finish.");
+            return;
+        }
+
         command_history.push_back(command);
         if (command_history.size() > MAX_COMMAND_HISTORY) {
             command_history.erase(command_history.begin());
@@ -1250,6 +1256,21 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
         // Handle built-in commands
         if (command == "clear" || command == "cls") {
             terminal_history.clear();
+            return;
+        }
+
+        // Handle cd command specially
+        if (command.substr(0, 3) == "cd ") {
+            std::string path = command.substr(3);
+            // Trim whitespace
+            path.erase(0, path.find_first_not_of(" \t\r\n"));
+            path.erase(path.find_last_not_of(" \t\r\n") + 1);
+            
+            if (path.empty() || path == "~") {
+                changeDirectory(getHomeDirectory());
+            } else {
+                changeDirectory(path);
+            }
             return;
         }
 
@@ -1267,6 +1288,13 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
 
     } catch (const std::exception& e) {
         terminal_history.push_back("Error: " + std::string(e.what()));
+        // If there was an error, try to get AI assistance
+        std::string error_msg = e.what();
+        std::string ai_help = getAIAssistance("I got this error while executing a command: " + error_msg + 
+                                             "\nCommand was: " + command + 
+                                             "\nCan you help fix it?");
+        terminal_history.push_back("\nAI Assistant suggests:");
+        terminal_history.push_back(ai_help);
     }
 }
 
@@ -1416,6 +1444,20 @@ void CursorClone::checkCommandOutput() {
                 line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
                 if (!line.empty()) {
                     terminal_history.push_back(line);
+                    
+                    // Check for error messages
+                    if (line.find("Error:") != std::string::npos || 
+                        line.find("error:") != std::string::npos ||
+                        line.find("failed") != std::string::npos ||
+                        line.find("command not found") != std::string::npos) {
+                        
+                        // Get AI assistance for the error
+                        std::string ai_help = getAIAssistance("I got this error while executing a command: " + line + 
+                                                            "\nCommand was: " + async_command->command + 
+                                                            "\nCan you help fix it?");
+                        terminal_history.push_back("\nAI Assistant suggests:");
+                        terminal_history.push_back(ai_help);
+                    }
                 }
             }
         }
@@ -1426,6 +1468,30 @@ void CursorClone::checkCommandOutput() {
         async_command->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         
         if (!async_command->waiting_for_input) {
+            // Get the exit status if possible
+            int status = 0;
+            if (async_command->pipe) {
+                #ifdef _WIN32
+                    status = _pclose(async_command->pipe);
+                #else
+                    status = pclose(async_command->pipe);
+                #endif
+                async_command->pipe = nullptr;
+            }
+
+            // If command failed and hasn't already shown an error message
+            if (status != 0 && terminal_history.back().find("AI Assistant suggests:") == std::string::npos) {
+                std::string error_msg = "Command exited with status " + std::to_string(status);
+                terminal_history.push_back("Error: " + error_msg);
+                
+                // Get AI assistance for the error
+                std::string ai_help = getAIAssistance("I got this error while executing a command: " + error_msg + 
+                                                    "\nCommand was: " + async_command->command + 
+                                                    "\nCan you help fix it?");
+                terminal_history.push_back("\nAI Assistant suggests:");
+                terminal_history.push_back(ai_help);
+            }
+
             async_command->running = false;
             async_command->command_running = false;
         }
