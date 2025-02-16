@@ -315,118 +315,219 @@ void CursorClone::writeFile(const std::string& path, const std::string& content)
 }
 
 std::string CursorClone::getAIAssistance(const std::string& query) {
-    try {
-        // Create input context string with safety checks
-        std::string context = "You are an AI programming assistant. You can run code directly in the terminal.\n\n";
-        context += "Important: When showing commands, use ```bash blocks and write ONLY the exact commands to run.\n";
-        context += "When showing Python code, use ```python blocks.\n";
-        context += "Current working directory: " + current_directory + "\n\n";
-        
-        // Add directory listing
-        context += "Files in current directory:\n";
-        for (const auto& entry : current_directory_files) {
-            context += (entry.is_directory() ? "[DIR] " : "[FILE] ") + 
-                      entry.path().filename().string() + "\n";
-        }
-        
-        // Add editor context
-        context += "\n" + std::string(editor.isFileOpen() ? 
-            "Current file: " + editor.getCurrentFile() : 
-            "No file is currently open.");
+    const int MAX_RETRIES = 3;
+    int retry_count = 0;
+    std::string last_error;
+    std::string current_script;  // Track the current script being processed
 
-        std::string response = groq_client.getCompletion(context + "\n\n" + query);
-        
-        // Add a simple separator
-        terminal_history.push_back("\n--- AI Assistant Response ---");
-        
-        // Process code blocks and execute them
-        size_t pos = 0;
-        bool first_command = true;
-        while ((pos = response.find("```", pos)) != std::string::npos) {
-            // Find the block type
-            size_t type_end = response.find('\n', pos);
-            if (type_end == std::string::npos) break;
+    while (retry_count < MAX_RETRIES) {
+        try {
+            // Create input context string with safety checks
+            std::string context = "You are an AI programming assistant. You can run code directly in the terminal.\n\n";
+            context += "Important: When showing commands, use ```bash blocks and write ONLY the exact commands to run.\n";
+            context += "When showing Python code, use ```python blocks.\n";
+            context += "Current working directory: " + current_directory + "\n\n";
             
-            std::string block_type = response.substr(pos + 3, type_end - (pos + 3));
-            // Remove any whitespace or extra characters
-            block_type = block_type.substr(0, block_type.find_first_of(" \t\r\n"));
-            
-            // Find the end of the code block
-            size_t start = type_end + 1;
-            size_t end = response.find("```", start);
-            if (end == std::string::npos) break;
-            
-            // Extract and clean the code/command
-            std::string content = response.substr(start, end - start);
-            // Trim whitespace and newlines
-            while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) {
-                content.pop_back();
-            }
-            while (!content.empty() && (content.front() == '\n' || content.front() == '\r')) {
-                content.erase(0, 1);
+            // Add directory listing
+            context += "Files in current directory:\n";
+            for (const auto& entry : current_directory_files) {
+                context += (entry.is_directory() ? "[DIR] " : "[FILE] ") + 
+                          entry.path().filename().string() + "\n";
             }
             
-            if (!content.empty()) {
-                if (block_type == "python") {
-                    // If not the first command, add a delay
-                    if (!first_command) {
-                        terminal_history.push_back("Waiting before next command...");
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
-                    }
-                    
-                    // Generate a unique filename for the Python script
-                    std::string filename = "ai_script_" + 
-                        std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + 
-                        ".py";
-                    
-                    terminal_history.push_back("Running Python script: " + filename);
-                    // Execute the Python code
-                    executeAIGeneratedCode(content, filename);
-                    
-                } else if (block_type == "bash") {
-                    // Split and execute each command line
-                    std::istringstream command_stream(content);
-                    std::string command;
-                    bool first_line = true;
-                    
-                    while (std::getline(command_stream, command)) {
-                        // Trim whitespace
-                        command.erase(0, command.find_first_not_of(" \t\r\n"));
-                        command.erase(command.find_last_not_of(" \t\r\n") + 1);
-                        
-                        if (!command.empty()) {
-                            // If not the first command overall or first line, add a delay
-                            if (!first_command || !first_line) {
-                                terminal_history.push_back("Waiting before next command...");
-                                std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Add editor context
+            context += "\n" + std::string(editor.isFileOpen() ? 
+                "Current file: " + editor.getCurrentFile() : 
+                "No file is currently open.");
+
+            // If this is a retry, add error context
+            if (retry_count > 0) {
+                context += "\n\nPrevious attempt failed with error: " + last_error + "\n";
+                context += "This is retry attempt " + std::to_string(retry_count) + " of " + std::to_string(MAX_RETRIES) + ".\n";
+                context += "Please provide a corrected response that addresses the error.\n";
+            }
+
+            std::string response = groq_client.getCompletion(context + "\n\n" + query);
+            
+            // Process code blocks and execute them
+            size_t pos = 0;
+            bool has_executed_script = false;  // Track if we've already executed a script
+            
+            while ((pos = response.find("```", pos)) != std::string::npos) {
+                // Find the block type
+                size_t type_end = response.find('\n', pos);
+                if (type_end == std::string::npos) break;
+                
+                std::string block_type = response.substr(pos + 3, type_end - (pos + 3));
+                // Remove any whitespace or extra characters
+                block_type = block_type.substr(0, block_type.find_first_of(" \t\r\n"));
+                
+                // Find the end of the code block
+                size_t start = type_end + 1;
+                size_t end = response.find("```", start);
+                if (end == std::string::npos) break;
+                
+                // Extract and clean the code/command
+                std::string content = response.substr(start, end - start);
+                // Trim whitespace and newlines
+                while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) {
+                    content.pop_back();
+                }
+                while (!content.empty() && (content.front() == '\n' || content.front() == '\r')) {
+                    content.erase(0, 1);
+                }
+                
+                if (!content.empty()) {
+                    try {
+                        if (block_type == "python" && !has_executed_script) {
+                            // Generate a unique filename for the Python script with full path
+                            fs::path script_path = fs::path(current_directory) / ("ai_script_" + 
+                                std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + 
+                                ".py");
+                            
+                            // Store the current script being processed
+                            current_script = script_path.string();
+                            
+                            // Write the Python script
+                            {
+                                std::ofstream file(script_path, std::ios::out | std::ios::binary);
+                                if (!file.is_open()) {
+                                    throw std::runtime_error("Could not create script file: " + script_path.string());
+                                }
+                                
+                                // Add Python headers
+                                file << "#!/usr/bin/env python3\n";
+                                file << "# -*- coding: utf-8 -*-\n\n";
+                                file << content;
+                                file.flush();  // Ensure content is written
+                                file.close();
                             }
+
+                            // Verify file exists and has content
+                            if (!fs::exists(script_path)) {
+                                throw std::runtime_error("Failed to create script file: " + script_path.string());
+                            }
+
+                            std::ifstream verify(script_path);
+                            if (!verify.good()) {
+                                throw std::runtime_error("Cannot read created script file: " + script_path.string());
+                            }
+                            verify.close();
                             
-                            terminal_history.push_back("$ " + command);
-                            executeCommandAsync(command);
+                            // Set execute permissions
+                            #if !defined(_WIN32)
+                            fs::permissions(script_path, 
+                                fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                                fs::perm_options::add);
+                            #endif
                             
-                            // Wait for the command to complete
+                            // Execute in the built-in terminal
+                            terminal_history.push_back("\n╔════════════════════════════════════════════════════════════╗");
+                            terminal_history.push_back("║                   Running Python Script                      ║");
+                            terminal_history.push_back("╠════════════════════════════════════════════════════════════╣");
+                            
+                            // Show the script path in terminal
+                            terminal_history.push_back("Script created at: " + script_path.string());
+                            terminal_history.push_back("Script contents:");
+                            terminal_history.push_back("```python");
+                            terminal_history.push_back(content);
+                            terminal_history.push_back("```");
+                            terminal_history.push_back("Output:");
+                            
+                            // Change to the script's directory and execute
+                            std::string cd_cmd = "cd \"" + current_directory + "\"";
+                            executeTerminalCommand(cd_cmd);
+                            
+                            // Execute using the built-in terminal with just the filename
+                            // Add -u flag to force unbuffered output for real-time streaming
+                            executeTerminalCommand("python3 -u \"" + script_path.filename().string() + "\" 2>&1");
+                            
+                            // Wait for the command to complete while processing output in real-time
                             while (async_command && async_command->running) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                                 checkCommandOutput();
+                                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Reduced sleep time for more responsive streaming
                             }
                             
-                            first_line = false;
+                            terminal_history.push_back("╚════════════════════════════════════════════════════════════╝\n");
+                            
+                            has_executed_script = true;  // Mark that we've executed a script
+                            
+                            // Clean up the script file after execution
+                            try {
+                                if (fs::exists(script_path)) {
+                                    fs::remove(script_path);
+                                }
+                            } catch (...) {
+                                // Ignore cleanup errors
+                            }
+                        } else if (block_type == "bash") {
+                            // Split and execute each command line
+                            std::istringstream command_stream(content);
+                            std::string command;
+                            while (std::getline(command_stream, command)) {
+                                // Trim whitespace
+                                command.erase(0, command.find_first_not_of(" \t\r\n"));
+                                command.erase(command.find_last_not_of(" \t\r\n") + 1);
+                                
+                                if (!command.empty()) {
+                                    executeTerminalCommand(command);
+                                    // Add a small delay between commands
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                }
+                            }
                         }
+                    } catch (const std::exception& e) {
+                        // Clean up the script file if it exists and there was an error
+                        if (!current_script.empty()) {
+                            try {
+                                fs::remove(current_script);
+                            } catch (...) {
+                                // Ignore cleanup errors
+                            }
+                        }
+                        // If code execution fails, store error and retry
+                        last_error = std::string(e.what());
+                        throw; // Re-throw to trigger retry
                     }
                 }
-                first_command = false;
+                
+                pos = end + 3;
             }
             
-            pos = end + 3;
+            // If we get here, everything succeeded
+            if (retry_count > 0) {
+                terminal_history.push_back("Successfully completed after " + std::to_string(retry_count) + " retries.");
+            }
+            return response;
+            
+        } catch (const std::exception& e) {
+            last_error = std::string(e.what());
+            retry_count++;
+            
+            if (retry_count >= MAX_RETRIES) {
+                // Clean up the script file if it exists and we've hit max retries
+                if (!current_script.empty()) {
+                    try {
+                        fs::remove(current_script);
+                    } catch (...) {
+                        // Ignore cleanup errors
+                    }
+                }
+                terminal_history.push_back("Error: Maximum retry attempts reached. Last error: " + last_error);
+                return "Error: Maximum retry attempts reached. Last error: " + last_error;
+            }
+            
+            terminal_history.push_back("Error occurred (attempt " + std::to_string(retry_count) + 
+                                     " of " + std::to_string(MAX_RETRIES) + "): " + last_error);
+            terminal_history.push_back("Retrying...");
+            
+            // Add a small delay before retrying
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        
-        terminal_history.push_back("--- End of AI Response ---\n");
-        return response;
-        
-    } catch (const std::exception& e) {
-        terminal_history.push_back("Error: " + std::string(e.what()));
-        return "Error: " + std::string(e.what());
     }
+    
+    // This should never be reached due to the return in the MAX_RETRIES check above
+    return "Error: Unexpected end of function";
 }
 
 void CursorClone::renderGUI() {
@@ -1241,12 +1342,6 @@ void CursorClone::navigateCommandHistory(bool up) {
 
 void CursorClone::executeTerminalCommand(const std::string& command) {
     try {
-        // Check if a command is already running
-        if (async_command && async_command->running) {
-            terminal_history.push_back("Error: A command is already running. Please wait for it to finish.");
-            return;
-        }
-
         command_history.push_back(command);
         if (command_history.size() > MAX_COMMAND_HISTORY) {
             command_history.erase(command_history.begin());
@@ -1256,21 +1351,6 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
         // Handle built-in commands
         if (command == "clear" || command == "cls") {
             terminal_history.clear();
-            return;
-        }
-
-        // Handle cd command specially
-        if (command.substr(0, 3) == "cd ") {
-            std::string path = command.substr(3);
-            // Trim whitespace
-            path.erase(0, path.find_first_not_of(" \t\r\n"));
-            path.erase(path.find_last_not_of(" \t\r\n") + 1);
-            
-            if (path.empty() || path == "~") {
-                changeDirectory(getHomeDirectory());
-            } else {
-                changeDirectory(path);
-            }
             return;
         }
 
@@ -1288,142 +1368,164 @@ void CursorClone::executeTerminalCommand(const std::string& command) {
 
     } catch (const std::exception& e) {
         terminal_history.push_back("Error: " + std::string(e.what()));
-        // If there was an error, try to get AI assistance
-        std::string error_msg = e.what();
-        std::string ai_help = getAIAssistance("I got this error while executing a command: " + error_msg + 
-                                             "\nCommand was: " + command + 
-                                             "\nCan you help fix it?");
-        terminal_history.push_back("\nAI Assistant suggests:");
-        terminal_history.push_back(ai_help);
     }
 }
 
 void CursorClone::executeCommandAsync(const std::string& command) {
-    // Handle special commands
-    if (command == "cd -") {
-        goBack();
-        return;
-    }
-
-    // Handle cd command specially
-    if (command.substr(0, 3) == "cd ") {
-        std::string path = command.substr(3);
-        // Trim whitespace
-        path.erase(0, path.find_first_not_of(" \t\r\n"));
-        path.erase(path.find_last_not_of(" \t\r\n") + 1);
+    try {
+        // Cancel any existing command
+        cancelCurrentLoading();
         
-        try {
-            changeDirectory(path);
-        } catch (const std::exception& e) {
-            terminal_history.push_back("Error: " + std::string(e.what()));
-        }
-        return;
-    }
-
-    // Rest of executeCommandAsync implementation for other commands...
-    cancelCurrentLoading();  // Cancel any existing command
-    
-    async_command = std::make_unique<AsyncCommand>();
-    async_command->command = command;
-    async_command->running = true;
-    async_command->command_running = true;  // Add this line
-    
-    // Create pipe for input
-    if (pipe(async_command->input_pipe) == -1) {
-        terminal_history.push_back("Error: Failed to create input pipe");
-        return;
-    }
-
-    // Create pseudo-terminal
-    async_command->master_fd = posix_openpt(O_RDWR | O_NOCTTY);
-    if (async_command->master_fd == -1) {
-        terminal_history.push_back("Error: Failed to create pseudo-terminal");
-        return;
-    }
-
-    grantpt(async_command->master_fd);
-    unlockpt(async_command->master_fd);
-
-    async_command->future = std::async(std::launch::async, [this, command]() {
-        // First change to the correct directory
-        if (chdir(current_directory.c_str()) != 0) {
-            std::string error = "Failed to change directory: " + std::string(strerror(errno));
-            terminal_history.push_back(error);
+        async_command = std::make_unique<AsyncCommand>();
+        async_command->command = command;
+        async_command->running = true;
+        async_command->command_running = true;
+        async_command->waiting_for_input = false;
+        
+        // Create pipes for input/output
+        if (pipe(async_command->input_pipe) == -1) {
+            terminal_history.push_back("Error: Failed to create input pipe");
             return;
         }
 
-        pid_t pid = fork();
-        
-        if (pid == 0) {  // Child process
-            // Set up slave end of PTY
-            int slave_fd = open(ptsname(async_command->master_fd), O_RDWR);
-            
-            // Redirect stdin/stdout/stderr
-            dup2(slave_fd, STDIN_FILENO);
-            dup2(slave_fd, STDOUT_FILENO);
-            dup2(slave_fd, STDERR_FILENO);
-            
-            // Connect input pipe to stdin
-            dup2(async_command->input_pipe[0], STDIN_FILENO);
-            
-            close(async_command->master_fd);
+        // Create pseudo-terminal
+        async_command->master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+        if (async_command->master_fd == -1) {
+            terminal_history.push_back("Error: Failed to create pseudo-terminal");
             close(async_command->input_pipe[0]);
             close(async_command->input_pipe[1]);
-            
-            // Set up environment
-            setenv("TERM", "xterm-256color", 1);
-            setenv("PYTHONUNBUFFERED", "1", 1);
-            setenv("PYTHONIOENCODING", "utf-8", 1);
-            
-            // Execute the command
-            execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
-            perror("execl failed");
-            exit(1);
+            return;
         }
-        
-        // Parent process
-        char buffer[1024];
-        fd_set read_fds;
-        
-        while (async_command && async_command->running) {
-            FD_ZERO(&read_fds);
-            FD_SET(async_command->master_fd, &read_fds);
-            
-            struct timeval tv = {0, 100000};  // 100ms timeout
-            
-            int ret = select(async_command->master_fd + 1, &read_fds, nullptr, nullptr, &tv);
-            
-            if (ret > 0 && FD_ISSET(async_command->master_fd, &read_fds)) {
-                ssize_t n = read(async_command->master_fd, buffer, sizeof(buffer) - 1);
-                if (n > 0) {
-                    buffer[n] = '\0';
-                    std::string output(buffer);
-                    
-                    // Check for common input prompts
-                    if (output.find("input(") != std::string::npos ||
-                        output.find("Input") != std::string::npos ||
-                        output.find("Enter") != std::string::npos ||
-                        output.find(": ") != std::string::npos ||
-                        output.find(">>> ") != std::string::npos ||  // Python prompt
-                        output.find("... ") != std::string::npos) {
-                        async_command->waiting_for_input = true;
-                    }
-                    
-                    std::lock_guard<std::mutex> lock(async_command->output_mutex);
-                    async_command->output_buffer.push_back(output);
-                }
+
+        // Set up PTY
+        grantpt(async_command->master_fd);
+        unlockpt(async_command->master_fd);
+
+        async_command->future = std::async(std::launch::async, [this, command]() {
+            // Change to the correct directory
+            if (chdir(current_directory.c_str()) != 0) {
+                std::string error = "Failed to change directory: " + std::string(strerror(errno));
+                terminal_history.push_back(error);
+                return;
             }
 
-            // Check if process has terminated
-            int status;
-            pid_t result = waitpid(pid, &status, WNOHANG);
-            if (result == pid) {
-                async_command->running = false;
-                async_command->command_running = false;
-                break;
+            pid_t pid = fork();
+            
+            if (pid == 0) {  // Child process
+                // Set up slave end of PTY
+                int slave_fd = open(ptsname(async_command->master_fd), O_RDWR);
+                
+                // Set up terminal attributes
+                struct termios tios;
+                tcgetattr(slave_fd, &tios);
+                cfsetspeed(&tios, B38400);
+                tios.c_lflag |= ICANON | ECHO;  // Enable canonical mode and echo
+                tcsetattr(slave_fd, TCSANOW, &tios);
+                
+                // Redirect stdin/stdout/stderr
+                dup2(slave_fd, STDIN_FILENO);
+                dup2(slave_fd, STDOUT_FILENO);
+                dup2(slave_fd, STDERR_FILENO);
+                
+                // Connect input pipe to stdin
+                dup2(async_command->input_pipe[0], STDIN_FILENO);
+                
+                close(async_command->master_fd);
+                close(async_command->input_pipe[0]);
+                close(async_command->input_pipe[1]);
+                
+                // Set up environment
+                setenv("TERM", "xterm-256color", 1);
+                setenv("PYTHONUNBUFFERED", "1", 1);
+                setenv("PYTHONIOENCODING", "utf-8:replace", 1);
+                setenv("LANG", "en_US.UTF-8", 1);
+                setenv("LC_ALL", "en_US.UTF-8", 1);
+                
+                // Execute the command
+                execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+                perror("execl failed");
+                exit(1);
+            }
+            
+            // Parent process
+            char buffer[4096];
+            fd_set read_fds;
+            
+            while (async_command && async_command->running) {
+                FD_ZERO(&read_fds);
+                FD_SET(async_command->master_fd, &read_fds);
+                
+                struct timeval tv = {0, 10000};  // 10ms timeout
+                
+                int ret = select(async_command->master_fd + 1, &read_fds, nullptr, nullptr, &tv);
+                
+                if (ret > 0 && FD_ISSET(async_command->master_fd, &read_fds)) {
+                    ssize_t n = read(async_command->master_fd, buffer, sizeof(buffer) - 1);
+                    if (n > 0) {
+                        buffer[n] = '\0';
+                        std::string output(buffer);
+                        
+                        // Check for input prompts
+                        if (output.find("input(") != std::string::npos ||
+                            output.find("Input") != std::string::npos ||
+                            output.find("Enter") != std::string::npos ||
+                            output.find(": ") != std::string::npos ||
+                            output.find(">>> ") != std::string::npos ||
+                            output.find("... ") != std::string::npos) {
+                            
+                            async_command->waiting_for_input = true;
+                            
+                            // Add visual indicator for input state
+                            std::lock_guard<std::mutex> lock(async_command->output_mutex);
+                            async_command->output_buffer.push_back(output);
+                            continue;
+                        }
+                        
+                        std::lock_guard<std::mutex> lock(async_command->output_mutex);
+                        async_command->output_buffer.push_back(output);
+                    }
+                }
+
+                // Check if process has terminated
+                int status;
+                pid_t result = waitpid(pid, &status, WNOHANG);
+                if (result == pid) {
+                    async_command->running = false;
+                    async_command->command_running = false;
+                    break;
+                }
+            }
+        });
+    } catch (const std::exception& e) {
+        terminal_history.push_back("Error launching command: " + std::string(e.what()));
+        if (async_command) {
+            async_command->running = false;
+            async_command->command_running = false;
+        }
+    }
+}
+
+// Add this helper method to send input to the running process
+void CursorClone::sendInput(const std::string& input) {
+    if (!async_command || !async_command->running) {
+        return;
+    }
+
+    try {
+        // Write the input to the pipe
+        if (async_command->input_pipe[1] != -1) {
+            ssize_t bytes_written = write(async_command->input_pipe[1], input.c_str(), input.length());
+            if (bytes_written < 0) {
+                throw std::runtime_error("Failed to write input: " + std::string(strerror(errno)));
             }
         }
-    });
+        
+        // Reset input state
+        async_command->waiting_for_input = false;
+        
+    } catch (const std::exception& e) {
+        terminal_history.push_back("Error sending input: " + std::string(e.what()));
+    }
 }
 
 void CursorClone::checkCommandOutput() {
@@ -1436,31 +1538,38 @@ void CursorClone::checkCommandOutput() {
             std::string output = async_command->output_buffer.front();
             async_command->output_buffer.pop_front();
             
-            // Split output into lines and add to terminal history
+            // Process output line by line for real-time streaming
             std::istringstream stream(output);
             std::string line;
             while (std::getline(stream, line)) {
                 // Remove carriage returns and other control characters
                 line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+                
+                // Filter out common terminal control sequences
+                size_t pos = 0;
+                while ((pos = line.find("\033[", pos)) != std::string::npos) {
+                    size_t end = line.find("m", pos);
+                    if (end != std::string::npos) {
+                        line.erase(pos, end - pos + 1);
+                    } else {
+                        break;
+                    }
+                }
+                
                 if (!line.empty()) {
                     terminal_history.push_back(line);
                     
-                    // Check for error messages
-                    if (line.find("Error:") != std::string::npos || 
-                        line.find("error:") != std::string::npos ||
-                        line.find("failed") != std::string::npos ||
-                        line.find("command not found") != std::string::npos) {
-                        
-                        // Get AI assistance for the error
-                        std::string ai_help = getAIAssistance("I got this error while executing a command: " + line + 
-                                                            "\nCommand was: " + async_command->command + 
-                                                            "\nCan you help fix it?");
-                        terminal_history.push_back("\nAI Assistant suggests:");
-                        terminal_history.push_back(ai_help);
-                    }
+                    // Force GUI update for real-time display
+                    ImGui::SetScrollHereY(1.0f);
                 }
             }
         }
+    }
+
+    // If waiting for input, show the input prompt
+    if (async_command->waiting_for_input) {
+        // The input handling is done in the GUI rendering code
+        return;
     }
 
     // Check if command has finished
@@ -1468,30 +1577,6 @@ void CursorClone::checkCommandOutput() {
         async_command->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         
         if (!async_command->waiting_for_input) {
-            // Get the exit status if possible
-            int status = 0;
-            if (async_command->pipe) {
-                #ifdef _WIN32
-                    status = _pclose(async_command->pipe);
-                #else
-                    status = pclose(async_command->pipe);
-                #endif
-                async_command->pipe = nullptr;
-            }
-
-            // If command failed and hasn't already shown an error message
-            if (status != 0 && terminal_history.back().find("AI Assistant suggests:") == std::string::npos) {
-                std::string error_msg = "Command exited with status " + std::to_string(status);
-                terminal_history.push_back("Error: " + error_msg);
-                
-                // Get AI assistance for the error
-                std::string ai_help = getAIAssistance("I got this error while executing a command: " + error_msg + 
-                                                    "\nCommand was: " + async_command->command + 
-                                                    "\nCan you help fix it?");
-                terminal_history.push_back("\nAI Assistant suggests:");
-                terminal_history.push_back(ai_help);
-            }
-
             async_command->running = false;
             async_command->command_running = false;
         }
@@ -1668,19 +1753,6 @@ std::string CursorClone::getHostname() {
         }
         return std::string(hostname);
     #endif
-}
-
-// Add this method to send input to the running process
-void CursorClone::sendInput(const std::string& input) {
-    if (!async_command || !async_command->running) {
-        return;
-    }
-
-    // Write the input to the pipe
-    if (async_command->input_pipe[1] != -1) {
-        write(async_command->input_pipe[1], input.c_str(), input.length());
-    }
-    async_command->waiting_for_input = false;
 }
 
 void CursorClone::executeAIGeneratedCode(const std::string& code, const std::string& filename) {

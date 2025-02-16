@@ -12,6 +12,53 @@ size_t GroqClient::WriteCallback(void* contents, size_t size, size_t nmemb, std:
     return size * nmemb;
 }
 
+size_t GroqClient::StreamingWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t total_size = size * nmemb;
+    auto* context = static_cast<StreamingContext*>(userp);
+    
+    // Add the new data to our buffer
+    context->buffer.append(static_cast<char*>(contents), total_size);
+    
+    // Process complete lines
+    size_t pos;
+    while ((pos = context->buffer.find('\n')) != std::string::npos) {
+        std::string line = context->buffer.substr(0, pos);
+        context->buffer.erase(0, pos + 1);
+        
+        // Skip empty lines
+        if (line.empty() || line == "\r") continue;
+        
+        // Remove "data: " prefix if present
+        if (line.substr(0, 6) == "data: ") {
+            line = line.substr(6);
+        }
+        
+        // Skip [DONE] message
+        if (line == "[DONE]") continue;
+        
+        try {
+            // Parse the JSON
+            json response = json::parse(line);
+            
+            // Extract the content
+            if (response.contains("choices") && !response["choices"].empty() &&
+                response["choices"][0].contains("delta") &&
+                response["choices"][0]["delta"].contains("content")) {
+                std::string content = response["choices"][0]["delta"]["content"];
+                if (!content.empty()) {
+                    context->callback(content);
+                    context->full_response += content;  // Accumulate the full response
+                }
+            }
+        } catch (const std::exception& e) {
+            // Skip malformed JSON
+            continue;
+        }
+    }
+    
+    return total_size;
+}
+
 std::string GroqClient::makeRequest(const std::string& endpoint, const json& request_data) {
     CURL* curl = curl_easy_init();
     std::string response;
@@ -60,6 +107,55 @@ std::string GroqClient::makeRequest(const std::string& endpoint, const json& req
         if (curl) curl_easy_cleanup(curl);
         throw;
     }
+}
+
+void GroqClient::getCompletionStreaming(const std::string& prompt, std::function<void(const std::string&)> callback) {
+    json request_data = {
+        {"model", "mixtral-8x7b-32768"},
+        {"messages", {{
+            {"role", "user"},
+            {"content", prompt}
+        }}},
+        {"stream", true},
+        {"temperature", 0.7},
+        {"max_tokens", 4096}
+    };
+
+    makeStreamingRequest("chat/completions", request_data, callback);
+}
+
+std::string GroqClient::makeStreamingRequest(const std::string& endpoint, const json& request_data, 
+                                           std::function<void(const std::string&)> callback) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        throw std::runtime_error("Failed to initialize CURL");
+    }
+
+    std::string url = api_endpoint + endpoint;
+    std::string request_body = request_data.dump();
+    struct curl_slist* headers = nullptr;
+    
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    std::string auth_header = "Authorization: Bearer " + api_key;
+    headers = curl_slist_append(headers, auth_header.c_str());
+
+    StreamingContext context{callback, "", ""};  // Initialize with empty full_response
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamingWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        throw std::runtime_error("CURL request failed: " + std::string(curl_easy_strerror(res)));
+    }
+
+    return context.full_response;  // Return the accumulated response
 }
 
 std::string GroqClient::getCompletion(const std::string& prompt) {

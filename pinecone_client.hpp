@@ -11,8 +11,8 @@
 class PineconeClient {
 private:
     std::string pinecone_key;
+    std::string pinecone_env;  // Add environment as member variable
     GroqClient& groq_client;  // For model interactions
-    static constexpr const char* ENVIRONMENT = "gcp-starter";
     static constexpr const char* INDEX_NAME = "directory-index";
     static constexpr int VECTOR_DIMENSION = 1536;
     CURL* curl;

@@ -6,7 +6,7 @@
 #include <algorithm>
 
 PineconeClient::PineconeClient(const std::string& pinecone_key, const std::string& pinecone_env, GroqClient& groq_client)
-    : pinecone_key(pinecone_key), groq_client(groq_client) {
+    : pinecone_key(pinecone_key), pinecone_env(pinecone_env), groq_client(groq_client) {
     
     // Initialize CURL
     curl = curl_easy_init();
@@ -59,7 +59,7 @@ size_t PineconeClient::WriteCallback(void* contents, size_t size, size_t nmemb, 
 
 std::string PineconeClient::makeRequest(const std::string& endpoint, const std::string& method, const nlohmann::json& data) {
     std::string url = "https://" + std::string(INDEX_NAME) + "-" + 
-                     std::string(ENVIRONMENT) + ".svc.pinecone.io/vectors/" + endpoint;
+                     pinecone_env + ".svc.pinecone.io/vectors/" + endpoint;
     std::string response;
     
     struct curl_slist* headers = nullptr;
@@ -92,7 +92,7 @@ std::vector<float> PineconeClient::getPineconeEmbedding(const std::string& text)
     };
 
     std::string url = "https://" + std::string(INDEX_NAME) + "-" + 
-                     std::string(ENVIRONMENT) + ".svc.pinecone.io/" + EMBEDDING_ENDPOINT;
+                     pinecone_env + ".svc.pinecone.io/" + EMBEDDING_ENDPOINT;
     std::string response;
     
     struct curl_slist* headers = nullptr;
@@ -236,14 +236,12 @@ std::string PineconeClient::makeControlRequest(const std::string& endpoint, cons
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);  // 30 second timeout
     
-    // Enable verbose debug output
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    
     if (method == "POST") {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         if (!data.is_null()) {
             std::string json_str = data.dump();
-            std::cout << "Request body: " << json_str << std::endl;  // Debug output
+            // Only log non-sensitive request data
+            std::cout << "Making " << method << " request to endpoint: " << endpoint << std::endl;
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
         }
     } else {
@@ -258,7 +256,8 @@ std::string PineconeClient::makeControlRequest(const std::string& endpoint, cons
             "\nURL: " + url);
     }
     
-    std::cout << "Response: " << response << std::endl;  // Debug output
+    // Only log that the request was successful, not the actual response which may contain sensitive data
+    std::cout << "Request to " << endpoint << " completed successfully" << std::endl;
     return response;
 }
 
